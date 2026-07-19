@@ -1,0 +1,1542 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>提案遊戲 演出模擬器</title>
+<style>
+  body{margin:0;background:#ffffff;color:#241509;font-family:"Microsoft JhengHei",sans-serif;display:flex;justify-content:center;gap:20px;padding:16px}
+  #cv{background:#F8EFC8;border-radius:18px;box-shadow:0 8px 30px rgba(0,0,0,.18);cursor:pointer}
+  #panel{width:250px;display:flex;flex-direction:column;gap:10px;padding-top:8px}
+  #panel h3{margin:4px 0 2px;font-size:15px;color:#241509}
+  button,select{font-family:inherit;font-size:14px;padding:9px 10px;border-radius:8px;border:1px solid #241509;background:#F8EFC8;color:#241509;cursor:pointer}
+  button:hover{background:#F3E3AE}
+  button.primary{background:#D9B54A;border-color:#241509;color:#241509;font-weight:bold}
+  button.primary:hover{background:#e8c766}
+  button.rec{background:#8c2f39;border-color:#8c2f39;color:#fff}
+  button:disabled{opacity:.4;cursor:default}
+  .hint{font-size:12px;color:#5a4a2a;line-height:1.6}
+  #recState{font-size:13px;color:#241509}
+</style>
+</head>
+<body>
+<canvas id="cv" width="720" height="1280" style="width:540px;height:960px"></canvas>
+<div id="panel">
+  <h3>模式</h3>
+  <select id="selScenario">
+    <option value="A">劇本A：打擊+YUMMY（三色打擊中 YUMMY → H&S）</option>
+    <option value="B">劇本B：固定+UPSIZED（固定三色中 UPSIZED → 雙盤面 H&S）</option>
+    <option value="C" selected>劇本C：3星星 → UP升外圈 → 多功能符號（大分球→加分→乘倍→全收）</option>
+    <option value="D">劇本D：紅星直升外圈-三特色（雙盤面・多功能各自演出）</option>
+    <option value="E">劇本E：內圈中多功能符號 → 7 顆球 → 連 3 次乘倍 → 落空結束</option>
+  </select>
+  <button class="primary" id="btnRun">▶ 播放劇本（H&S 要自己按 SPIN）</button>
+  <button id="btnReset">↺ 回到 BG 初始狀態</button>
+  <h3>速度</h3>
+  <select id="selSpeed">
+    <option value="0.7">慢（講解用）</option>
+    <option value="1" selected>正常</option>
+    <option value="1.6">快</option>
+    <option value="3">極快（測試）</option>
+  </select>
+  <h3>錄影（輸出 WebM）</h3>
+  <button class="rec" id="btnRec">● 開始錄影</button>
+  <button id="btnStop" disabled>■ 停止並下載</button>
+  <div id="recState"></div>
+  <div class="hint">
+    流程：選劇本 → 「開始錄影」→「播放劇本」→ 停止下載 → WebM 上傳 Drive → Slides 插入。<br><br>
+    BG 收集＝三色SC 打擊上方三個寶盆（UPSIZED／YUMMY／MAGIC），**單次打擊 8% 觸發**，觸發的寶盆蓋起來；本局蓋上的寶盆組合＝進 H&S 的特色組合。星星＝輪盤（紅星直轉外圈）。分數球只在 H&S 出現。<br><br>
+    帶規則：一個 REEL 停下只會出現**一種顏色的分數球或星星**（不混色、不同框）；星星每軌最多 1 顆；分數球同軌**絕不相鄰**（最多 2 顆＝上下兩格、中間隔一格）；WILD 只在 R2–R4。<br>
+    H&S **每一格都是獨立滾輪**：分數球在該格滾輪內捲動，透過格子看有沒有球滾過去或停下來。每次 SPIN 都要玩家自己按。彩金金額示意（數學組另訂）。
+  </div>
+</div>
+<script>
+"use strict";
+/* ================= 基本設定（紅金色調） ================= */
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const COL = {
+  gold:'#F2C14E', goldD:'#D4A017', goldDD:'#B8860B', goldL:'#FFE9A8',
+  red:'#C0331F', redD:'#8E1610', redDD:'#5E0E0A', maroon:'#4A0D0B',
+  green:'#2E9E5B', greenD:'#1F7A43', purple:'#7B2D8E', purpleD:'#5A1F69', purpleL:'#C79AD9', purpleM:'#9A55B5',
+  ink:'#3A0D08', cream:'#F7EBD0', dim:'#C99A4B',
+  paper:'#F8EFC8',   // SLOT 底色：淺黃（整台機器／畫面的底）
+  tile:'#F3E3AE',    // 機台格子底色（比 paper 略深，跟黑線一起界定格子）
+  line:'#241509',    // 機台線條：深黑
+  deep:'#D9B54A'     // 重要讀數框底色（BET/WIN／彩金框）：深黃
+};
+let SPEED = 1;
+let GEN=0;                       // 世代 token：backToBG 時 ++，讓所有進行中的 sleep/tween/nextTick 立刻中止
+const ABORT={__abort:true};
+const sleep = ms => { const g=GEN; return new Promise((res,rej)=>setTimeout(()=> g!==GEN?rej(ABORT):res(), ms/SPEED)); };
+function ease(u){ return 1-Math.pow(1-u,3); }
+let tickResolvers=[];
+function nextTick(){ const g=GEN; return new Promise((res,rej)=>tickResolvers.push(()=> g!==GEN?rej(ABORT):res())); }
+async function tween(dur, fn){ const t0=performance.now(); const d=dur/SPEED;
+  while(true){ const u=Math.min(1,(performance.now()-t0)/d); fn(u); if(u>=1)return; await nextTick(); } }
+const rnd=(a,b)=>a+Math.random()*(b-a), ri=(a,b)=>Math.floor(rnd(a,b+1)), pick=a=>a[ri(0,a.length-1)];
+
+/* ================= 狀態 ================= */
+const st = {
+  busy:false, msg:'按 SPIN 開始', win:0, banner:null, bannerScale:1, flashT:0,
+  topMode:'idle',
+  grid: Array(15).fill(null),
+  reels:{spin:[0,0,0,0,0], off:[0,0,0,0,0], anticip:[false,false,false,false,false]},
+  meters:{coins:0, stars:0},
+  pots:[{closed:false,lidT:0,pulse:0},{closed:false,lidT:0,pulse:0},{closed:false,lidT:0,pulse:0}],  // 0紅UPSIZED 1綠YUMMY 2金MAGIC
+  hs:null,
+  wheel:{rotIn:-20, rotOut:-8, hiIn:-1, hiOut:-1, flashIn:false, flashOut:false, dim:'none', zoom:0}
+};
+function resetWheel(){ st.wheel={rotIn:-20, rotOut:-8, hiIn:-1, hiOut:-1, flashIn:false, flashOut:false, dim:'none', zoom:0}; }
+
+/* 三個寶盆（粉／綠／藍；盆上英文特色名；BG 分數球顏色對應） */
+const POT = [
+  {en:'UPSIZED', zh:'雙盤面',     c1:'#F58BBB', c2:'#B23A72', ring:'#FFB3D4'},
+  {en:'YUMMY',   zh:'SPIN回4',    c1:'#54C47E', c2:'#1F7A43', ring:'#7FE39B'},
+  {en:'MAGIC',   zh:'多功能符號', c1:'#6FA8E8', c2:'#2E5FA3', ring:'#9CC4F5'}
+];
+const BALL_MULTS=[0.2,0.5,0.5,1,1,2,5];  // BG 分數球分值＝BET 倍數
+const BET_AMT=88;
+const TOPBOX={x:36,y:36,w:648,h:430};
+function potPos(i){ return [360+(i-1)*200, TOPBOX.y+352]; }   // 以機台中心(360)對齊置中；間距 200（放大後會互相碰到，允許）
+
+/* 符號機率（使用者定）＋帶規則 */
+const STAR_P = [0.03, 0.01, 0.02, 0.05, 0.03];   // 星星（輪盤SC）；同輪帶間隔≥2 → 畫面每輪最多 1 顆；R5 半數紅星
+const COIN_P = [0.06, 0.04, 0.04, 0.06, 0.06];   // 分數球（打擊寶盆）；使用者 0712：每個 REEL 出現率再多一倍（原 3/2/2/3/3%）
+const LOW_POOL = ['A','A','A','A','K','K','K','K','Q','Q','Q','Q','J','J','J','J','M1','M1','M2','M2','M3','M3','M4','M5'];
+function lowSym(){ return {type:'low', v:pick(LOW_POOL)}; }
+function rollReel(c){
+  const col=[null,null,null];
+  // 一個 REEL 停下時只會出現「一種顏色的分數球」或「星星」，兩者不同時、顏色不混
+  const pStar=3*STAR_P[c], pCoin=2.2*COIN_P[c], r=Math.random();
+  if(r < pStar){
+    col[ri(0,2)] = (c===4 && Math.random()<0.5)? {type:'gsc'} : {type:'sc'};   // 星星每軌最多 1 顆
+  } else if(r < pStar+pCoin){
+    // 分數球：strip 上成對、中間隔其他標誌 → 畫面同軌**絕不相鄰**（一對＝row0＋row2，或只看到其中一顆）
+    const cc=ri(0,2), coin=()=>({type:'csc',c:cc,mult:pick(BALL_MULTS)});
+    if(Math.random()<0.25){ col[0]=coin(); col[2]=coin(); }
+    else col[ri(0,2)]=coin();
+  }
+  if(c>=1 && c<=3){
+    for(let r=0;r<3;r++) if(!col[r] && Math.random()<0.02) col[r]={type:'wild'};
+  }
+  for(let r=0;r<3;r++) if(!col[r]) col[r]=lowSym();
+  return col;
+}
+function randomGrid(){
+  const g=Array(15).fill(null);
+  for(let c=0;c<5;c++){ const col=rollReel(c); for(let r=0;r<3;r++) g[r*5+c]=col[r]; }
+  return g;
+}
+function freshGrid(){ for(let i=0;i<15;i++) st.grid[i]=lowSym(); st.meters={coins:0,stars:0}; st.pots.forEach(p=>{p.closed=false;p.lidT=0;p.pulse=0;}); }
+freshGrid();
+
+/* ================= FX 系統（打擊效果） ================= */
+const fx=[];
+let shakeMag=0, shakeUntil=0;
+function shake(m,ms){ shakeMag=m; shakeUntil=performance.now()+ms; }
+function fxRing(x,y,c){ fx.push({k:'ring',x,y,c,t:performance.now()}); }
+function fxPop(s,x,y,c){ fx.push({k:'pop',s,x,y,c,t:performance.now()}); }
+function fxFly(x0,y0,x1,y1,c){ fx.push({k:'fly',x0,y0,x1,y1,c,t:performance.now(),dur:360/SPEED}); }   // BG 打擊彗星（快一點）
+function fxSpiral(x0,y0,cx,cy,c,val){ fx.push({k:'spiral',x0,y0,cx,cy,c,val,t:performance.now(),dur:900/SPEED}); }
+function fxWin(x0,y0,val){ fx.push({k:'win',x0,y0,x1:566,y1:1072,c:COL.goldL,val,t:performance.now(),dur:640/SPEED}); }
+function fxFire(x0,y0,x1,y1){ fx.push({k:'fire',x0,y0,x1,y1,t:performance.now(),dur:560/SPEED}); }   // 從 BET ×N 噴火到滿輪 reel
+function flash(){ st.flashT=performance.now(); }
+function drawFX(){
+  const now=performance.now();
+  for(let i=fx.length-1;i>=0;i--){
+    const f=fx[i], dur= f.k==='ring'?320 : f.k==='pop'?700 : f.dur;
+    const u=(now-f.t)/dur;
+    if(u>=1){ fx.splice(i,1); continue; }
+    if(f.k==='ring'){
+      ctx.strokeStyle=f.c; ctx.globalAlpha=(1-u); ctx.lineWidth=7*(1-u)+1;
+      ctx.beginPath(); ctx.arc(f.x,f.y,18+90*ease(u),0,7); ctx.stroke(); ctx.globalAlpha=1;
+    } else if(f.k==='pop'){
+      ctx.globalAlpha=1-u*u; ctx.font='bold 32px "Microsoft JhengHei"'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      const y=f.y-52*ease(u);
+      ctx.lineWidth=6; ctx.strokeStyle=COL.redDD; ctx.strokeText(f.s,f.x,y);
+      ctx.fillStyle=f.c; ctx.fillText(f.s,f.x,y); ctx.globalAlpha=1;
+    } else if(f.k==='spiral'){ // 旋渦吸入：盤面分數沿螺旋捲進中心
+      const ang0=Math.atan2(f.y0-f.cy, f.x0-f.cx), r0=Math.hypot(f.x0-f.cx, f.y0-f.cy);
+      const uu=ease(u), rad=r0*(1-uu), ang=ang0+uu*7;
+      const px=f.cx+rad*Math.cos(ang), py=f.cy+rad*Math.sin(ang);
+      ctx.globalAlpha=Math.max(0,1-u*u*u);
+      ctx.save(); ctx.shadowColor=f.c; ctx.shadowBlur=16;
+      ctx.fillStyle=f.c; ctx.beginPath(); ctx.arc(px,py,13*(1-0.45*uu),0,7); ctx.fill(); ctx.restore();
+      if(f.val) txtS(f.val, px, py, Math.max(13,18*(1-0.35*uu)), COL.goldL, COL.redDD, 3);
+      ctx.globalAlpha=1;
+    } else if(f.k==='win'){ // 分數球飛進 WIN 欄（滿 REEL 收分）
+      const uu=ease(u), px=f.x0+(f.x1-f.x0)*uu, py=f.y0+(f.y1-f.y0)*uu-70*Math.sin(Math.PI*uu);
+      ctx.globalAlpha=Math.max(0,1-u*u);
+      ctx.save(); ctx.shadowColor=f.c; ctx.shadowBlur=16;
+      ctx.fillStyle=f.c; ctx.beginPath(); ctx.arc(px,py,13*(1-0.3*uu),0,7); ctx.fill(); ctx.restore();
+      if(f.val) txtS(f.val, px, py, 16, '#fff', COL.redDD, 3);
+      ctx.globalAlpha=1;
+    } else if(f.k==='fire'){ // 噴火拋物線（橘紅黃火尾）
+      const mx=(f.x0+f.x1)/2, my=Math.min(f.y0,f.y1)-90;
+      const bez=t=>{ const a=1-t; return [a*a*f.x0+2*a*t*mx+t*t*f.x1, a*a*f.y0+2*a*t*my+t*t*f.y1]; };
+      const cols=['#FFF0A0','#FFC83C','#FF7A00','#F23A0E','#C0331F','#8E1610'];
+      for(let k=5;k>=0;k--){
+        const tt=Math.max(0,u-k*0.06); const [px,py]=bez(ease(tt));
+        ctx.globalAlpha= k===0?1:(0.6-0.09*k);
+        ctx.save(); ctx.shadowColor='#FF6A00'; ctx.shadowBlur= k===0?24:12;
+        ctx.fillStyle=cols[k]; ctx.beginPath(); ctx.arc(px,py, k===0?13:Math.max(2,11-k*1.4), 0,7); ctx.fill(); ctx.restore();
+      }
+      ctx.globalAlpha=1;
+    } else { // fly：打擊彗星（要肉眼看得清楚）
+      const mx=(f.x0+f.x1)/2, my=Math.min(f.y0,f.y1)-140;
+      const bez=(t)=>{ const a=1-t; return [a*a*f.x0+2*a*t*mx+t*t*f.x1, a*a*f.y0+2*a*t*my+t*t*f.y1]; };
+      for(let k=3;k>=0;k--){
+        const tt=Math.max(0,u-k*0.07); const [px,py]=bez(ease(tt));
+        ctx.globalAlpha= k===0?1 : (0.45-0.12*k);
+        ctx.save(); ctx.shadowColor=f.c; ctx.shadowBlur= k===0?28:10;
+        ctx.fillStyle= k===0? '#FFFFFF' : f.c;
+        ctx.beginPath(); ctx.arc(px,py, k===0?15:11-k*2, 0,7); ctx.fill(); ctx.restore();
+      }
+      ctx.globalAlpha=1;
+    }
+  }
+  if(st.flashT && now-st.flashT<320){
+    ctx.fillStyle='rgba(255,230,150,'+(0.55*(1-(now-st.flashT)/320))+')';
+    ctx.fillRect(0,0,720,1280);
+  }
+}
+
+/* ================= 繪圖工具 ================= */
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function txt(s,x,y,size,color,bold=true,align='center'){ ctx.fillStyle=color; ctx.font=(bold?'bold ':'')+size+'px "Microsoft JhengHei"'; ctx.textAlign=align; ctx.textBaseline='middle'; ctx.fillText(s,x,y); }
+function txtS(s,x,y,size,fill,stroke,lw=5,align='center'){ ctx.font='bold '+size+'px "Microsoft JhengHei"'; ctx.textAlign=align; ctx.textBaseline='middle'; ctx.lineWidth=lw; ctx.strokeStyle=stroke; ctx.strokeText(s,x,y); ctx.fillStyle=fill; ctx.fillText(s,x,y); }
+function goldGrad(){ return COL.line; }   // 機台線條：一律深黑（原本的金色漸層改deprecate，保留函式名相容呼叫端）
+/* 火焰版文字（×2／×3 用）：橘黃漸層＋外光＋字上方跳動火舌 */
+function drawFireX(cx,cy,str,size){
+  const now=performance.now(), flick=0.5+0.5*Math.sin(now/70);
+  ctx.save(); ctx.textAlign='center'; ctx.textBaseline='middle';
+  for(let k=-1;k<=1;k++){                       // 火舌
+    const fxp=cx+k*size*0.30, fh=size*(0.55+0.35*Math.sin(now/90+k*1.3));
+    const fg=ctx.createLinearGradient(0,cy-size*0.5-fh,0,cy-size*0.2);
+    fg.addColorStop(0,'rgba(255,90,0,0)'); fg.addColorStop(.55,'#FF7A00'); fg.addColorStop(1,'#FFD84A');
+    ctx.fillStyle=fg; ctx.beginPath();
+    ctx.moveTo(fxp-size*0.15, cy-size*0.28);
+    ctx.quadraticCurveTo(fxp-size*0.05, cy-size*0.5-fh, fxp, cy-size*0.5-fh);
+    ctx.quadraticCurveTo(fxp+size*0.05, cy-size*0.5-fh, fxp+size*0.15, cy-size*0.28);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.font='bold '+size+'px "Microsoft JhengHei"';
+  ctx.shadowColor='#FF6A00'; ctx.shadowBlur=14+8*flick;
+  ctx.lineWidth=Math.max(4,size*0.13); ctx.strokeStyle='#7A1500'; ctx.strokeText(str,cx,cy);
+  const g=ctx.createLinearGradient(0,cy-size*0.5,0,cy+size*0.5);
+  g.addColorStop(0,'#FFEB4A'); g.addColorStop(.5,'#FF9000'); g.addColorStop(1,'#E82600');
+  ctx.shadowBlur=0; ctx.fillStyle=g; ctx.fillText(str,cx,cy);
+  ctx.restore();
+}
+/* 乘倍圖片示意：金環獎章＋紅色 ×N＋火光（參考真機 ×2/×3/×5 金幣） */
+function drawMultCoin(cx,cy,r,n){   // 純 ×N 紅字＋火焰（不要金色圓圈）
+  const now=performance.now(), flick=0.5+0.5*Math.sin(now/70);
+  ctx.save(); ctx.translate(cx,cy);
+  // 火舌繞一圈（跳動）
+  for(let k=0;k<12;k++){
+    const ang=k*(Math.PI*2/12)-Math.PI/2, fh=r*(0.5+0.42*Math.sin(now/80+k*1.7));
+    const bx=Math.cos(ang)*r*0.5, by=Math.sin(ang)*r*0.5, tx=Math.cos(ang)*(r*0.5+fh), ty=Math.sin(ang)*(r*0.5+fh);
+    const perp=ang+Math.PI/2, wx=Math.cos(perp)*r*0.16, wy=Math.sin(perp)*r*0.16;
+    const g=ctx.createLinearGradient(bx,by,tx,ty);
+    g.addColorStop(0,'rgba(255,110,0,0)'); g.addColorStop(.5,'#FF7A00'); g.addColorStop(1,'#FFE24A');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.moveTo(bx-wx,by-wy); ctx.quadraticCurveTo(tx,ty,bx+wx,by+wy); ctx.closePath(); ctx.fill();
+  }
+  const s=r*1.2;                                                         // ×N 紅字（立體）＋火光
+  ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.font='bold '+s+'px "Microsoft JhengHei"';
+  ctx.shadowColor='#FF6A00'; ctx.shadowBlur=18+10*flick;
+  ctx.lineWidth=Math.max(3,s*.14); ctx.strokeStyle='#5A0A05'; ctx.strokeText('×'+n,0,0);
+  const tg=ctx.createLinearGradient(0,-s*.5,0,s*.5);
+  tg.addColorStop(0,'#FF8A5A'); tg.addColorStop(1,'#C0100A');
+  ctx.shadowBlur=0; ctx.fillStyle=tg; ctx.fillText('×'+n,0,0);
+  ctx.restore();
+}
+/* H&S 盤面上方 G-R-A-N-D 字母（每盤各自，滿一整軌就亮起） */
+const GRAND_LETTERS=['G','R','A','N','D'];
+function drawGrandLetters(bi, gridTop){
+  if(!st.hs || !st.hs.grandLit) return;
+  for(let c=0;c<5;c++){
+    const cx=BX+c*(CW+GAP)+CW/2, cy=gridTop-20, lit=st.hs.grandLit[bi]&&st.hs.grandLit[bi][c];
+    ctx.save();
+    if(lit){ ctx.shadowColor='#FF9A20'; ctx.shadowBlur=18; }
+    const g=ctx.createLinearGradient(0,cy-16,0,cy+16);
+    if(lit){ g.addColorStop(0,'#FFF0A0'); g.addColorStop(1,'#F08A00'); }
+    else { g.addColorStop(0,'#EAD9A8'); g.addColorStop(1,'#C6AE6E'); }
+    ctx.font='bold 30px "Microsoft JhengHei"'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.lineWidth=4; ctx.strokeStyle= lit? '#7A1500':'rgba(36,21,9,.55)'; ctx.strokeText(GRAND_LETTERS[c],cx,cy);
+    ctx.fillStyle=g; ctx.fillText(GRAND_LETTERS[c],cx,cy);
+    ctx.restore();
+  }
+}
+
+function drawBall(x,y,r,val,big=false,rot=0){
+  const g=ctx.createRadialGradient(x-r*.3,y-r*.35,r*.15,x,y,r);
+  g.addColorStop(0,'#FFF3C0'); g.addColorStop(.5,big?'#FFD75E':COL.gold); g.addColorStop(1,'#9A6E08');
+  ctx.save(); if(big){ ctx.shadowColor=COL.gold; ctx.shadowBlur=18; }
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill();
+  ctx.strokeStyle='#FFF0C2'; ctx.lineWidth=2.5; ctx.stroke(); ctx.restore();
+  if(rot){ // 滾動中：旋轉的紋路（數字保持正立好讀）
+    ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+    ctx.strokeStyle='rgba(255,255,255,.5)'; ctx.lineWidth=Math.max(2,r*.13);
+    ctx.beginPath(); ctx.arc(0,0,r*.6,-0.55,0.85); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0,0,r*.6,Math.PI-0.55,Math.PI+0.85); ctx.stroke();
+    ctx.restore();
+  }
+  const hot = (typeof val==='number') && val > BET_AMT*10;   // 超過 10×BET → 變色（含乘倍/滿輪×N 後才破線的球）
+  txtS(val, x, y, Math.max(24,r*.66), hot?'#E5352A':'#fff', hot?'#FFF3C0':'#7A4A05', 5);
+}
+/* H&S 每格＝獨立滾輪：分數球在該格的滾輪內捲動，透過格子窗口看有沒有球滾過去 */
+function drawRollers(ox,oy,cw,gap,rollers,scale){
+  if(!rollers||!rollers.length) return;
+  ctx.save(); ctx.translate(ox,oy); ctx.scale(scale,scale);
+  for(const rl of rollers){
+    const cx=(rl.i%5)*(cw+gap), cy=Math.floor(rl.i/5)*(cw+gap);
+    ctx.save(); rr(cx,cy,cw,cw,10); ctx.clip();
+    const L=rl.strip.length, base=Math.floor(rl.off), frac=rl.off-base;
+    for(let j=-1;j<=1;j++){
+      const item=rl.strip[((base+j)%L+L)%L];
+      if(!item) continue;
+      const iy=cy+(frac-j)*(cw+gap);
+      if(item.type==='multi'){                        // 滾動中的元寶：一點點光拖尾
+        const mx=cx+cw/2, my=iy+cw/2;
+        const tg=ctx.createLinearGradient(mx,my-cw*0.95,mx,my+cw*0.95);
+        tg.addColorStop(0,'rgba(255,130,90,0)'); tg.addColorStop(.5,'rgba(255,140,95,0.33)'); tg.addColorStop(1,'rgba(255,130,90,0)');
+        ctx.fillStyle=tg; ctx.fillRect(mx-cw*0.30,my-cw*0.95,cw*0.60,cw*1.9);
+      }
+      drawSym(item, cx, iy, cw);
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+}
+function starPath(x,y,rO){
+  const rI=rO*.45;
+  ctx.beginPath();
+  for(let k=0;k<10;k++){
+    const a=-Math.PI/2 + k*Math.PI/5, r=k%2===0?rO:rI;
+    const px=x+r*Math.cos(a), py=y+r*Math.sin(a);
+    if(k===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  }
+  ctx.closePath();
+}
+function drawStar(x,y,r,red){   // scatter＝迷你輪盤圖示（金＝一般→轉輪盤、紅＝紅色輪盤→直升外圈）
+  const segN=8, sw=2*Math.PI/segN, top=-Math.PI/2;
+  const seg = red? ['#E6564A','#B4231A'] : ['#F4CE6A','#D89A2A'];
+  const rim = red? '#7A0F06' : '#8A5A08';
+  ctx.save(); ctx.shadowColor= red? '#FF6B5E' : '#F0A83A'; ctx.shadowBlur= red? 16 : 13;   // 一點點光暈（同有色分數球SC）
+  for(let k=0;k<segN;k++){
+    ctx.fillStyle=seg[k%2];
+    ctx.beginPath(); ctx.moveTo(x,y); ctx.arc(x,y,r,top+k*sw,top+(k+1)*sw); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+  ctx.strokeStyle='#FFF6D8'; ctx.lineWidth=1.5;   // 分隔線
+  for(let k=0;k<segN;k++){ const a=top+k*sw; ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+r*Math.cos(a),y+r*Math.sin(a)); ctx.stroke(); }
+  ctx.strokeStyle=rim; ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.stroke();   // 外圈
+  const hg=ctx.createRadialGradient(x,y,1,x,y,r*.32);   // 中心軸
+  hg.addColorStop(0,'#fff'); hg.addColorStop(1, red?'#E23D2E':COL.gold);
+  ctx.fillStyle=hg; ctx.beginPath(); ctx.arc(x,y,r*.3,0,7); ctx.fill();
+  ctx.strokeStyle=rim; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.fillStyle=rim;   // 頂端指針
+  ctx.beginPath(); ctx.moveTo(x-r*.16,y-r-2); ctx.lineTo(x+r*.16,y-r-2); ctx.lineTo(x,y-r*.7); ctx.closePath(); ctx.fill();
+}
+function drawCoin(x,y,r,cc,mult){
+  const P=POT[cc];
+  ctx.save(); ctx.shadowColor=P.ring; ctx.shadowBlur=12;
+  const g=ctx.createRadialGradient(x-r*.3,y-r*.35,r*.12,x,y,r);
+  g.addColorStop(0,P.c1); g.addColorStop(1,P.c2);
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill();
+  ctx.strokeStyle='#fff'; ctx.lineWidth=2.5; ctx.stroke(); ctx.restore();
+  const val=Math.round((mult||1)*BET_AMT);   // 分值＝BET 88 × 倍數（與打擊派彩同值）
+  txtS(String(val), x, y, r*.46, '#fff', P.c2, 4);
+}
+function drawYuanbao(w,h,red){   // 元寶（金錠）：船形本體＋兩端上翹＋頂端乳釘（red＝紅色元寶）
+  const W=w*0.46, H=h*0.30;
+  const g=ctx.createLinearGradient(0,-H*0.7,0,H*1.5);
+  if(red){ g.addColorStop(0,'#FFC2AE'); g.addColorStop(.5,'#FF6A54'); g.addColorStop(1,'#C23A22'); }   // 淺亮紅
+  else { g.addColorStop(0,COL.goldL); g.addColorStop(.5,COL.gold); g.addColorStop(1,COL.goldDD); }
+  ctx.fillStyle=g; ctx.strokeStyle=red?'#FFE9A8':COL.goldD; ctx.lineWidth=3; ctx.lineJoin='round';
+  if(red){ const gl=0.6+0.4*Math.sin(performance.now()/300); ctx.shadowColor='rgba(255,95,60,'+(0.7+0.25*gl).toFixed(2)+')'; ctx.shadowBlur=H*(1.1+0.6*gl); }   // 呼吸光暈
+  ctx.beginPath();
+  ctx.moveTo(-W, -H*0.15);
+  ctx.quadraticCurveTo(-W*1.03, H*0.6, -W*0.55, H*0.95);   // 左側下弧
+  ctx.quadraticCurveTo(0, H*1.5, W*0.55, H*0.95);          // 底部弧
+  ctx.quadraticCurveTo(W*1.03, H*0.6, W, -H*0.15);         // 右側→右端
+  ctx.quadraticCurveTo(W*0.72, -H*0.62, W*0.42, -H*0.34);  // 右端上翹
+  ctx.quadraticCurveTo(0, -H*0.02, -W*0.42, -H*0.34);      // 中間凹槽
+  ctx.quadraticCurveTo(-W*0.72, -H*0.62, -W, -H*0.15);     // 左端上翹
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur=0;                                   // 乳釘不重疊光暈
+  const bg=ctx.createLinearGradient(0,-H*0.75,0,-H*0.05);
+  if(red){ bg.addColorStop(0,'#FFD9C4'); bg.addColorStop(1,'#D8452A'); }   // 紅元寶的乳釘（同步淺亮）
+  else { bg.addColorStop(0,'#FFF3C0'); bg.addColorStop(1,COL.goldD); }
+  ctx.fillStyle=bg;
+  ctx.beginPath(); ctx.ellipse(0,-H*0.38,W*0.28,H*0.34,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+}
+function drawMulti(x,y,w,h,reveal,flip=1){
+  ctx.save(); ctx.translate(x,y); ctx.scale(Math.max(.06,Math.abs(flip)),1);
+  if(!reveal){   // 多功能符號＝紅色元寶、不放字
+    ctx.save(); ctx.translate(0,-h*0.02); drawYuanbao(w*1.02,h*0.9,true); ctx.restore();
+    ctx.restore(); return;
+  }
+  const g=ctx.createLinearGradient(-w/2,-h/2,w/2,h/2);
+  if(!reveal){ g.addColorStop(0,COL.gold); g.addColorStop(1,COL.red); }
+  else if(reveal==='honey'){ g.addColorStop(0,'#E9756B'); g.addColorStop(1,COL.redD); }
+  else if(reveal==='chili'){ g.addColorStop(0,'#54c47e'); g.addColorStop(1,COL.greenD); }
+  else if(reveal==='bigball'){ g.addColorStop(0,COL.goldL); g.addColorStop(1,COL.goldDD); }
+  else { g.addColorStop(0,COL.purpleL); g.addColorStop(1,COL.purpleM); }   // 乘倍：淺一點的紫
+  ctx.fillStyle=g; rr(-w/2,-h/2,w,h,14); ctx.fill();
+  ctx.strokeStyle=COL.goldL; ctx.lineWidth=3; ctx.stroke();
+  if(!reveal){ txtS('？',0,-8,44,'#fff',COL.redDD,5); txt('多功能',0,30,17,'#fff'); }
+  else if(reveal==='honey'){ txtS('收',0,-10,40,'#fff',COL.redDD,5); txt('蜂蜜・全收',0,28,15,'#fff'); }
+  else if(reveal==='chili'){ txtS('加',0,-10,40,'#fff',COL.greenD,5); txt('辣椒・加分',0,28,15,'#fff'); }
+  else if(reveal==='bigball'){ drawBall(0,-12,20,''); txt('大分球',0,28,16,'#7A4A05'); }
+  else { txtS('×',0,-10,44,'#fff',COL.purpleD,5); txt('乘倍',0,28,16,'#fff'); }
+  ctx.restore();
+}
+function drawSym(cell,x,y,cw){
+  if(!cell) return;
+  const now=performance.now();
+  let sc=1;
+  if(cell.born){ const k=(now-cell.born)/180; if(k>=1) delete cell.born; else sc=1+.35*Math.sin(Math.PI*Math.min(1,k)); }
+  ctx.save(); ctx.translate(x+cw/2,y+cw/2); ctx.scale(sc,sc); ctx.translate(-(x+cw/2),-(y+cw/2));
+  if(cell.type==='low'){
+    // BG 低倍符號：只畫字，不畫格子框（REEL 是一整條直立滾輪，外框由 reel 長方形負責）
+    txt(cell.v, x+cw/2, y+cw/2, 34, COL.line);
+  }
+  else if(cell.type==='ball') {
+    if(cell.flip!==undefined){
+      const grow=1.5;   // 轉動中稍微放大（微微蓋到鄰格）；停下移除 flip 即回正常大小
+      ctx.save(); ctx.translate(x+cw/2,y+cw/2); ctx.scale(grow*Math.max(.06,Math.abs(cell.flip)), grow);
+      drawBall(0,0,cw*.38,cell.val,cell.big);
+      ctx.restore();
+    } else drawBall(x+cw/2,y+cw/2,cw*.38,cell.val,cell.big);
+  }
+  else if(cell.type==='sc') drawStar(x+cw/2,y+cw/2,cw*.4,false);
+  else if(cell.type==='gsc') drawStar(x+cw/2,y+cw/2,cw*.42,true);
+  else if(cell.type==='csc') drawCoin(x+cw/2,y+cw/2,cw*.38,cell.c,cell.mult??1);
+  else if(cell.type==='multi') drawMulti(x+cw/2,y+cw/2,cw-14,cw-14,cell.reveal,cell.flip??1);
+  else if(cell.type==='wild'){
+    txt('WILD', x+cw/2, y+cw/2, 24, COL.line);
+  }
+  ctx.restore();
+}
+
+/* ================= 版面 ================= */
+const TOP=TOPBOX, BOT={x:36,y:486,w:648,h:470};
+const CW=110, GAP=0, BX=85, BY=586;   // GAP=0：REEL 緊貼；BX=85 置中；BY 往下移（上方留給 SPIN＋GRAND，下方本來就有空間）
+const B1Y=TOP.y+86;                    // 上盤（FEATURE 2）盤面頂：也往下留出 SPIN＋GRAND 空間
+function cellXY(i){ return [BX+(i%5)*(CW+GAP), BY+Math.floor(i/5)*(CW+GAP)]; }
+function cellC(i){ const [x,y]=cellXY(i); return [x+CW/2,y+CW/2]; }
+/* 兩盤通用座標：bi=0 下盤、bi=1 上盤（FEATURE 2，origin BX,B1Y） */
+function cellXYbi(bi,i){ return bi===0? cellXY(i) : [BX+(i%5)*(CW+GAP), B1Y+Math.floor(i/5)*(CW+GAP)]; }
+function cellCbi(bi,i){ const [x,y]=cellXYbi(bi,i); return [x+CW/2,y+CW/2]; }
+
+function drawBoardGrid(x0,y0,cw,gap,cells,scale=1,rollers=null){
+  ctx.save(); ctx.translate(x0,y0); ctx.scale(scale,scale);
+  for(let i=0;i<15;i++){
+    const x=(i%5)*(cw+gap), y=Math.floor(i/5)*(cw+gap);
+    ctx.fillStyle=COL.tile; rr(x,y,cw,cw,10); ctx.fill();
+    ctx.strokeStyle='rgba(36,21,9,.3)'; ctx.lineWidth=2; ctx.stroke();
+    drawSym(cells[i],x,y,cw);
+  }
+  ctx.restore();
+  if(rollers) drawRollers(x0,y0,cw,gap,rollers,scale);
+  // 大分球翻面畫最上層（蓋鄰格）
+  ctx.save(); ctx.translate(x0,y0); ctx.scale(scale,scale);
+  for(let i=0;i<15;i++){ const cc=cells[i]; if(cc&&cc.type==='ball'&&cc.flip!==undefined){ drawSym(cc,(i%5)*(cw+gap),Math.floor(i/5)*(cw+gap),cw); } }
+  ctx.restore();
+}
+
+/* ---- 同心雙圈輪盤（內圈=第一層、外圈=第二層；BG 小顆無字，轉時放大置中有字） ---- */
+const SEG_IN  = ['雙盤面','SPIN回4','多功能符號','MAJOR','三特色全開','UP'];
+const SEG_OUT = ['雙盤面＋SPIN回4','多功能符號','MAJOR','雙盤面＋多功能符號','GRAND','SPIN回4＋多功能符號','三特色全開','UP'];
+const WR_OUT=270, WR_MID=182, WR_IN=172;   // 放大版基準半徑
+function segStyle(n,i){
+  // 輪盤色塊不上色：只用兩種淺黃單色交錯＋深墨字，靠黑線分隔（不靠色相區分）
+  return [i%2? COL.tile : COL.paper, COL.line];
+}
+function segLinesIn(n){
+  const MAP={'多功能符號':['多功能','符號'],'三特色全開':['三特色','全開']};
+  return MAP[n]||[n];
+}
+function segLinesOut(n){
+  const MAP={
+    '多功能符號':['多功能','符號'],'三特色全開':['三特色','全開'],
+    '雙盤面＋SPIN回4':['雙盤面＋','SPIN回4'],
+    '雙盤面＋多功能符號':['雙盤面＋','多功能','符號'],
+    'SPIN回4＋多功能符號':['SPIN回4','＋多功能','符號']};
+  return MAP[n]||[n];
+}
+function annulusSeg(cx,cy,r0,r1,a0,a1){
+  ctx.beginPath(); ctx.arc(cx,cy,r1,a0,a1); ctx.arc(cx,cy,r0,a1,a0,true); ctx.closePath();
+}
+function radialLabel(cx,cy,midDeg,r0,lines,color,size){
+  const a=midDeg*Math.PI/180;
+  ctx.save(); ctx.translate(cx,cy);
+  let rot=a, alignLeft=true;
+  if(Math.cos(a)<0){ rot=a+Math.PI; alignLeft=false; }
+  ctx.rotate(rot);
+  ctx.font='bold '+size+'px "Microsoft JhengHei"'; ctx.fillStyle=color; ctx.textBaseline='middle';
+  ctx.textAlign= alignLeft? 'left':'right';
+  const x0= alignLeft? r0 : -r0;
+  const off=(lines.length-1)*(size+3)/2;
+  lines.forEach((ln,i)=>ctx.fillText(ln, x0, -off+i*(size+3)));
+  ctx.restore();
+}
+function drawDualWheel(cx,cy,S,labels){
+  const w=st.wheel;
+  const rOut=WR_OUT*S, rMid=WR_MID*S, rIn=WR_IN*S;
+  const swO=360/SEG_OUT.length, swI=360/SEG_IN.length;
+  for(let i=0;i<SEG_OUT.length;i++){
+    const a0=(w.rotOut+i*swO)*Math.PI/180, a1=(w.rotOut+(i+1)*swO)*Math.PI/180;
+    ctx.fillStyle=segStyle(SEG_OUT[i],i)[0];
+    annulusSeg(cx,cy,rMid,rOut,a0,a1); ctx.fill();
+    ctx.strokeStyle=COL.line; ctx.lineWidth=Math.max(1.2,2*S); ctx.stroke();
+  }
+  if(labels) for(let i=0;i<SEG_OUT.length;i++){
+    radialLabel(cx,cy, w.rotOut+(i+.5)*swO, rMid+6, segLinesOut(SEG_OUT[i]), segStyle(SEG_OUT[i],i)[1], Math.round(22*S));
+  }
+  for(let i=0;i<SEG_IN.length;i++){
+    const a0=(w.rotIn+i*swI)*Math.PI/180, a1=(w.rotIn+(i+1)*swI)*Math.PI/180;
+    ctx.fillStyle=segStyle(SEG_IN[i],i)[0];
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,rIn,a0,a1); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle=COL.line; ctx.lineWidth=Math.max(1,1.5*S); ctx.stroke();
+  }
+  if(labels) for(let i=0;i<SEG_IN.length;i++){
+    radialLabel(cx,cy, w.rotIn+(i+.5)*swI, 58, segLinesIn(SEG_IN[i]), segStyle(SEG_IN[i],i)[1], Math.round(22*S));
+  }
+  if(w.dim==='out'){ annulusSeg(cx,cy,rMid,rOut,0,7); ctx.fillStyle='rgba(30,6,4,.72)'; ctx.fill(); }
+  if(w.dim==='in'){ ctx.beginPath(); ctx.arc(cx,cy,rIn,0,7); ctx.fillStyle='rgba(30,6,4,.72)'; ctx.fill(); }
+  if(w.hiOut>=0){
+    const a0=(w.rotOut+w.hiOut*swO)*Math.PI/180, a1=(w.rotOut+(w.hiOut+1)*swO)*Math.PI/180;
+    if(w.flashOut){ annulusSeg(cx,cy,rMid,rOut,a0,a1); ctx.fillStyle='rgba(255,240,180,.6)'; ctx.fill(); }
+    annulusSeg(cx,cy,rMid,rOut,a0,a1); ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(2,4*S); ctx.stroke();
+  }
+  if(w.hiIn>=0){
+    const a0=(w.rotIn+w.hiIn*swI)*Math.PI/180, a1=(w.rotIn+(w.hiIn+1)*swI)*Math.PI/180;
+    if(w.flashIn){ ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,rIn,a0,a1); ctx.closePath(); ctx.fillStyle='rgba(255,240,180,.6)'; ctx.fill(); }
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,rIn,a0,a1); ctx.closePath(); ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(2,4*S); ctx.stroke();
+  }
+  ctx.strokeStyle=goldGrad(); ctx.lineWidth=Math.max(2,6*S);
+  ctx.beginPath(); ctx.arc(cx,cy,rOut,0,7); ctx.stroke();
+  ctx.lineWidth=Math.max(1.5,4*S); ctx.beginPath(); ctx.arc(cx,cy,(rMid+rIn)/2,0,7); ctx.stroke();
+  const hubR=Math.max(12,46*S);
+  ctx.fillStyle=COL.paper; ctx.beginPath(); ctx.arc(cx,cy,hubR,0,7); ctx.fill();   // 輪盤中心也無色（淺黃）
+  ctx.strokeStyle=COL.line; ctx.lineWidth=Math.max(1.5,3*S); ctx.stroke();
+  if(labels) txt(w.dim==='in'?'×3':'×2', cx, cy, 22, COL.line);
+  ctx.strokeStyle=COL.line; ctx.lineWidth=Math.max(1.5,3*S);
+  ctx.beginPath(); ctx.moveTo(cx,cy-rOut+6*S); ctx.lineTo(cx,cy-hubR-10*S); ctx.stroke();
+  ctx.fillStyle=COL.line; ctx.strokeStyle=COL.line; ctx.lineWidth=Math.max(1,2*S); ctx.beginPath();
+  ctx.moveTo(cx-16*S*1.6,cy-rOut-20*S*1.4); ctx.lineTo(cx+16*S*1.6,cy-rOut-20*S*1.4); ctx.lineTo(cx,cy-rOut+10*S); ctx.closePath(); ctx.fill(); ctx.stroke();
+}
+
+/* ---- 上螢幕彩金列 ---- */
+function drawJackpots(){
+  // 4 個彩金名字方格（不放數字）：底色統一用比 BG 淺黃底色深一點的黃色，深黑字，同色系乾淨呈現
+  const NAMES=['GRAND','MAJOR','MINOR','MINI'];
+  const bw=148, gap=12, x0=TOP.x+(TOP.w-(4*bw+3*gap))/2, y=TOP.y+12, h=48;
+  NAMES.forEach((name,k)=>{
+    const x=x0+k*(bw+gap), gold= k===0;
+    ctx.save(); if(gold){ ctx.shadowColor='#F2C14E'; ctx.shadowBlur=10; }
+    ctx.fillStyle=COL.deep; rr(x,y,bw,h,10); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle=COL.line; ctx.lineWidth=2.5; rr(x,y,bw,h,10); ctx.stroke();
+    txt(name, x+bw/2, y+h/2, 22, COL.line);
+  });
+}
+/* ---- 三個寶盆（累積物） ---- */
+function drawPot(i){
+  const [px,py]=potPos(i), P=POT[i], pot=st.pots[i];
+  const now=performance.now();
+  let sc=1.5;                           // 寶盆再放大（允許互相碰到）
+  if(pot.pulse){ const k=(now-pot.pulse)/260; if(k<1) sc*=1+.22*Math.sin(Math.PI*k); }
+  ctx.save(); ctx.translate(px,py); ctx.scale(sc,sc);
+  if(pot.closed){ ctx.shadowColor=P.ring; ctx.shadowBlur=16; }
+  // 盆身
+  const g=ctx.createLinearGradient(0,-40,0,44);
+  g.addColorStop(0,P.c1); g.addColorStop(1,P.c2);
+  ctx.beginPath();
+  ctx.moveTo(-62,-18); ctx.quadraticCurveTo(-70,34,-30,44); ctx.lineTo(30,44);
+  ctx.quadraticCurveTo(70,34,62,-18); ctx.closePath();
+  ctx.fillStyle=g; ctx.fill();
+  ctx.strokeStyle=COL.goldL; ctx.lineWidth=3; ctx.stroke();
+  ctx.shadowBlur=0;
+  // 盆口
+  ctx.beginPath(); ctx.ellipse(0,-18,62,16,0,0,7);
+  ctx.fillStyle=P.c2; ctx.fill(); ctx.strokeStyle=COL.goldL; ctx.lineWidth=3; ctx.stroke();
+  // 盆內金幣（未蓋上時）
+  if(!pot.closed){
+    for(let k=0;k<5;k++){
+      const gx=-32+k*16, gy=-27-(k%2)*8;
+      const cg=ctx.createRadialGradient(gx-3,gy-3,1,gx,gy,11);
+      cg.addColorStop(0,'#FFF3C0'); cg.addColorStop(1,'#B8860B');
+      ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(gx,gy,11,0,7); ctx.fill();
+      ctx.strokeStyle='#8a6508'; ctx.lineWidth=1.5; ctx.stroke();
+    }
+  }
+  // 英文特色名（盆身上）
+  txtS(P.en, 0, 16, 18, '#fff', P.c2, 4);
+  // 蓋子（觸發後蓋起來；特色結束回 BG 時往上掀開）
+  if(pot.closed){
+    let ly=-18, k=1;
+    if(pot.opening){ k=Math.min(1,(now-pot.opening)/320); ly=-18-84*ease(k); }        // 開蓋：往上掀
+    else if(pot.lidT){ k=Math.min(1,(now-pot.lidT)/300); ly=-18-70*(1-ease(k)); }      // 蓋上：往下落
+    ctx.save(); if(k>=1){ ctx.shadowColor=P.ring; ctx.shadowBlur=18; }
+    const lg=ctx.createLinearGradient(0,ly-18,0,ly+18);
+    lg.addColorStop(0,'#FFF3C0'); lg.addColorStop(1,COL.goldDD);
+    ctx.beginPath(); ctx.ellipse(0,ly,66,18,0,0,7); ctx.fillStyle=lg; ctx.fill();
+    ctx.strokeStyle=P.c2; ctx.lineWidth=2.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0,ly-12,8,0,7); ctx.fillStyle=P.c2; ctx.fill();
+    ctx.strokeStyle=COL.goldL; ctx.lineWidth=2; ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+/* ================= 主繪製 ================= */
+function screenBg(x,y,w,h){
+  ctx.fillStyle=COL.paper; rr(x,y,w,h,14); ctx.fill();
+  ctx.strokeStyle=goldGrad(); ctx.lineWidth=3; rr(x,y,w,h,14); ctx.stroke();
+}
+/* 小財神：簡單線條版（參考畫面上那隻；低調不搶眼，只用單色線） */
+function drawFortuneGod(cx,cy,s){
+  ctx.save(); ctx.translate(cx,cy); ctx.scale(s,s);
+  ctx.lineJoin='round'; ctx.lineCap='round'; const L=COL.line;
+  ctx.strokeStyle=L; ctx.lineWidth=2.4;
+  ctx.beginPath(); ctx.arc(0,2,32,0,7); ctx.stroke();                                  // 臉
+  ctx.beginPath(); ctx.arc(-31,2,7,-0.5,0.5,true); ctx.stroke();                        // 左耳
+  ctx.beginPath(); ctx.arc(31,2,7,Math.PI-0.5,Math.PI+0.5,true); ctx.stroke();          // 右耳
+  ctx.beginPath(); ctx.moveTo(-20,-6); ctx.quadraticCurveTo(-13,-13,-5,-7); ctx.stroke();// 左眉
+  ctx.beginPath(); ctx.moveTo(20,-6); ctx.quadraticCurveTo(13,-13,5,-7); ctx.stroke();   // 右眉
+  ctx.fillStyle=L;
+  ctx.beginPath(); ctx.arc(-11,0,2.6,0,7); ctx.fill();                                  // 左眼
+  ctx.beginPath(); ctx.arc(11,0,2.6,0,7); ctx.fill();                                   // 右眼
+  ctx.beginPath(); ctx.moveTo(0,10); ctx.quadraticCurveTo(-10,12,-18,4);
+  ctx.moveTo(0,10); ctx.quadraticCurveTo(10,12,18,4); ctx.stroke();                     // 八字鬍
+  ctx.beginPath(); ctx.arc(0,12,7,0.25,Math.PI-0.25); ctx.stroke();                     // 笑口
+  ctx.beginPath(); ctx.moveTo(-13,18); ctx.quadraticCurveTo(-7,42,0,44); ctx.quadraticCurveTo(7,42,13,18); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,22); ctx.lineTo(0,42); ctx.stroke();                    // 鬍鬚
+  // 帽（最後畫、先填 paper 蓋住額頭再描線）
+  ctx.fillStyle=COL.paper;
+  ctx.beginPath(); ctx.moveTo(-31,-22); ctx.quadraticCurveTo(-38,-58,0,-58); ctx.quadraticCurveTo(38,-58,31,-22); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-35,-22); ctx.lineTo(35,-22); ctx.stroke();               // 帽簷
+  ctx.beginPath(); ctx.ellipse(-49,-28,15,5,-0.1,0,7); ctx.fill(); ctx.stroke();         // 左翅
+  ctx.beginPath(); ctx.ellipse(49,-28,15,5,0.1,0,7); ctx.fill(); ctx.stroke();           // 右翅
+  ctx.beginPath(); ctx.arc(0,-40,8,0,7); ctx.stroke(); ctx.strokeRect(-3,-43,6,6);      // 中央錢幣飾
+  ctx.restore();
+}
+function hsFeatureName(f){
+  const p=[]; if(f.u)p.push('UPSIZED'); if(f.y)p.push('YUMMY'); if(f.m)p.push('MAGIC');
+  return p.length===3? '三特色全開' : (p.join('　＋　')||'H&S 收集');
+}
+function hsFeatureColor(f){   // 特色名用寶盆上的配色：單一特色＝該寶盆深色；多特色＝紅
+  const on=[f.u,f.y,f.m].filter(Boolean);
+  if(on.length===1) return f.u?POT[0].c2 : f.y?POT[1].c2 : POT[2].c2;
+  return '#C0331F';
+}
+function drawTop(){
+  screenBg(TOP.x,TOP.y,TOP.w,TOP.h);
+  ctx.save(); rr(TOP.x,TOP.y,TOP.w,TOP.h,14); ctx.clip();
+  if(st.hs && st.topMode==='board2' && st.hs.boards[1]){
+    const g2x=BX, g2y=B1Y;                       // 與下盤同 X
+    drawSpinRail(1, g2y);
+    drawGrandLetters(1, g2y);                    // 上盤也有 G-R-A-N-D
+    drawBoardGrid(g2x, g2y, CW, GAP, st.hs.boards[1], 1, st.hs.rollers&&st.hs.rollers[1]);
+    drawColFrame(1, g2x, g2y, CW, GAP);
+  } else if(st.hs){
+    // H&S 不放寶盆：擺一隻小財神（簡單線條）＋特色名（用寶盆上的樣式：白字＋特色色描邊）
+    drawFortuneGod(360, TOP.y+130, 1.6);
+    const f=st.hs.flags;
+    txtS(hsFeatureName(f), 360, TOP.y+266, 44, '#fff', hsFeatureColor(f), 7);
+  } else {
+    drawJackpots();
+    if(st.wheel.zoom<=0) drawDualWheel(TOP.x+TOP.w/2, TOP.y+168, 0.28, false);
+    for(let i=0;i<3;i++) drawPot(i);
+  }
+  ctx.restore();
+}
+function drawSpinRail(bi, gridTop){   // SPIN 場次：橫排放在該盤面上方，簡單扁圓圈（不做成分數球樣式）
+  const hs=st.hs; if(!hs || !hs.boards[bi]) return;
+  const n=hs.max, R=14, sp=38, labelW=54, gap=12;
+  const totalW=labelW+gap+n*sp, x0=360-totalW/2, y= gridTop-54;   // SPIN 在上、GRAND 字母在下、盤面在最下
+  txt('SPIN', x0+labelW/2, y, 19, COL.line);
+  for(let k=0;k<n;k++){
+    const cx=x0+labelW+gap+k*sp+sp/2, on=k<hs.spins[bi], hi=hs.justReset[bi]&&on;
+    ctx.fillStyle= on? COL.deep : 'rgba(36,21,9,.10)';   // 扁平單色，非金球漸層
+    ctx.beginPath(); ctx.arc(cx,y,R,0,7); ctx.fill();
+    ctx.strokeStyle= hi? COL.gold : COL.line; ctx.lineWidth= hi?3:2; ctx.stroke();
+    txt(String(k+1), cx, y+1, 15, on?COL.line:'rgba(36,21,9,.35)');
+  }
+}
+function drawReelFlames(x,y,w,h){   // 紅色火焰框住整個 reel（發光外框＋沿周邊火舌）
+  const now=performance.now();
+  ctx.save();
+  ctx.strokeStyle='#FF5A3C'; ctx.lineWidth=5;
+  ctx.shadowColor='#FF3A1A'; ctx.shadowBlur=18+9*Math.sin(now/120);
+  rr(x-3,y-3,w+6,h+6,12); ctx.stroke();
+  ctx.shadowBlur=0;
+  const pts=[], step=26;
+  for(let px=x; px<=x+w; px+=step){ pts.push([px,y,0,-1]); pts.push([px,y+h,0,1]); }   // 上下緣
+  for(let py=y; py<=y+h; py+=step){ pts.push([x,py,-1,0]); pts.push([x+w,py,1,0]); }   // 左右緣
+  for(const [px,py,nx,ny] of pts){
+    const fh=9+11*Math.abs(Math.sin(now/90+px*0.09+py*0.06));
+    const g=ctx.createLinearGradient(px,py,px+nx*fh,py+ny*fh);
+    g.addColorStop(0,'#FFD84A'); g.addColorStop(.5,'#FF7A00'); g.addColorStop(1,'rgba(240,58,14,0)');
+    ctx.fillStyle=g;
+    const perpx=-ny, perpy=nx, wd=6;
+    ctx.beginPath();
+    ctx.moveTo(px-perpx*wd, py-perpy*wd);
+    ctx.quadraticCurveTo(px+nx*fh, py+ny*fh, px+perpx*wd, py+perpy*wd);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawColFrame(bi, ox, oy, cw, gap){   // 滿軌收分：紅色火焰框住整個 reel
+  const cf=st.hs&&st.hs.colFrame; if(!cf||!cf.flame||cf.bi!==bi) return;
+  drawReelFlames(ox+cf.c*(cw+gap), oy, cw, 3*cw+2*gap);
+}
+/* H&S 多功能符號覆蓋層：乘倍選取框／加分跳動數字／全收旋渦（皆 board[0] 座標） */
+function drawHSFx(){
+  if(!st.hs) return;
+  const now=performance.now();
+  if(st.hs.ring){                                   // 乘倍：漂浮的乘倍圈（顯示 ×N，再飛向球）
+    const rg=st.hs.ring, fl=0.6+0.4*Math.sin(now/90);
+    ctx.save(); ctx.translate(rg.x,rg.y);
+    ctx.shadowColor='#C9A0F0'; ctx.shadowBlur=22+8*fl;   // 紫色外暈（貼參考真機）
+    ctx.strokeStyle='#FFE9A8'; ctx.lineWidth=7; ctx.beginPath(); ctx.arc(0,0,rg.r,0,7); ctx.stroke();
+    ctx.strokeStyle='#D4A017'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(0,0,rg.r-8,0,7); ctx.stroke();
+    ctx.restore();
+    drawMultCoin(rg.x,rg.y,rg.r*0.5,rg.n);              // 中心 ×N 紅字＋火光
+  }
+  if(st.hs.num){                                    // 加分：跳動數字
+    const n=st.hs.num, p=1+0.12*Math.sin(now/60);
+    ctx.save(); ctx.translate(n.x,n.y); ctx.scale(p,p);
+    txtS('+'+n.val, 0, 0, 42, '#7FE39B', COL.redDD, 6);
+    ctx.restore();
+  }
+  if(st.hs.swirl){                                  // 全收：旋渦
+    const s=st.hs.swirl, rot=now/200, arms=6;
+    ctx.save(); ctx.translate(s.x,s.y);
+    for(let a=0;a<arms;a++){
+      ctx.beginPath();
+      for(let t=0;t<=1.001;t+=0.06){
+        const ang=a*(2*Math.PI/arms)+rot+t*5.5, rad=(1-t)*84;
+        const px=rad*Math.cos(ang), py=rad*Math.sin(ang);
+        if(t===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+      }
+      ctx.strokeStyle='rgba(233,117,107,0.55)'; ctx.lineWidth=3.5;
+      ctx.shadowColor='#E9756B'; ctx.shadowBlur=10; ctx.stroke();
+    }
+    const g=ctx.createRadialGradient(0,0,2,0,0,26);
+    g.addColorStop(0,'rgba(255,240,200,0.95)'); g.addColorStop(1,'rgba(233,117,107,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,26,0,7); ctx.fill();
+    ctx.restore();
+  }
+}
+function drawBottom(){
+  screenBg(BOT.x,BOT.y,BOT.w,BOT.h);
+  const cells = st.hs? st.hs.boards[0] : st.grid;
+  ctx.save(); rr(BOT.x,BOT.y,BOT.w,BOT.h,14); ctx.clip();
+  drawSpinRail(0, BY);
+  if(st.hs){
+    // H&S：每一格都是獨立滾輪 → 維持獨立格子
+    for(let c=0;c<5;c++){
+      const x=BX+c*(CW+GAP);
+      for(let r=0;r<3;r++){
+        const i=r*5+c, y=BY+r*(CW+GAP);
+        ctx.fillStyle=COL.tile; rr(x,y,CW,CW,4); ctx.fill();
+        ctx.strokeStyle=COL.line; ctx.lineWidth=2; rr(x,y,CW,CW,4); ctx.stroke();
+        drawSym(cells[i],x,y,CW);
+      }
+    }
+    if(st.hs.rollers) drawRollers(BX,BY,CW,GAP,st.hs.rollers[0],1);
+    for(let i=0;i<15;i++){ const cc=cells[i]; if(cc&&cc.type==='ball'&&cc.flip!==undefined){ const [x,y]=cellXY(i); drawSym(cc,x,y,CW); } }  // 大分球翻面畫最上層（蓋鄰格）
+    drawGrandLetters(0, BY);            // 下盤上方 G-R-A-N-D（滿軌亮起）
+    drawColFrame(0, BX, BY, CW, GAP);
+  } else {
+    // BG：五個 REEL 緊貼成一整片盤面（外框一圈＋內部細直線分隔）
+    const rh=3*CW+2*GAP, gw=5*CW+4*GAP;
+    ctx.save(); rr(BX,BY,gw,rh,12); ctx.clip();
+    const pulse=0.55+0.45*Math.sin(performance.now()/180);
+    for(let c=0;c<5;c++){
+      const x=BX+c*(CW+GAP);
+      ctx.fillStyle=COL.tile; ctx.fillRect(x,BY,CW,rh);
+      if(st.reels.anticip[c] && st.reels.spin[c]===1){   // 瞇牌：整條 REEL 暖光底
+        ctx.fillStyle='rgba(255,190,60,'+(0.28*pulse).toFixed(3)+')'; ctx.fillRect(x,BY,CW,rh);
+      }
+      if(st.reels.spin[c]===1){
+        const off=st.reels.off[c]%(CW+GAP);
+        for(let r=-1;r<4;r++){ const y=BY+r*(CW+GAP)+off;
+          ctx.globalAlpha=.5; drawSym(st.reels.strip?st.reels.strip[c][(r+40)%7]:lowSym(),x,y,CW); ctx.globalAlpha=1; }
+      } else {
+        for(let r=0;r<3;r++){ const i=r*5+c, y=BY+r*(CW+GAP); drawSym(cells[i],x,y,CW); }
+      }
+    }
+    ctx.restore();
+    ctx.strokeStyle=COL.line; ctx.lineWidth=2;   // 內部分隔線
+    for(let c=1;c<5;c++){ const x=BX+c*CW; ctx.beginPath(); ctx.moveTo(x,BY); ctx.lineTo(x,BY+rh); ctx.stroke(); }
+    ctx.lineWidth=3; rr(BX,BY,gw,rh,12); ctx.stroke();   // 外框
+    // 瞇牌 REEL 外緣光暈（畫在 clip 外，光暈才不被裁）
+    for(let c=0;c<5;c++){ if(st.reels.anticip[c] && st.reels.spin[c]===1){
+      const x=BX+c*(CW+GAP);
+      ctx.save(); ctx.shadowColor='#FFC83C'; ctx.shadowBlur=22*pulse+8;
+      ctx.strokeStyle='rgba(255,205,80,'+(0.6+0.4*pulse).toFixed(3)+')'; ctx.lineWidth=4;
+      ctx.strokeRect(x+2,BY+2,CW-4,rh-4); ctx.restore();
+    }}
+  }
+  ctx.restore();
+  // 字幕列已移除（BG／H&S 都拿掉解釋文字，貼近真機）；st.msg 仍更新供除錯讀取
+}
+function canSpin(){ return !st.busy || (st.hs && st.hs.waiting); }
+function drawDeck(){
+  ctx.fillStyle=COL.paper; rr(36,996,648,248,16); ctx.fill();
+  ctx.strokeStyle=goldGrad(); ctx.lineWidth=3; rr(36,996,648,248,16); ctx.stroke();
+  const readG=ctx.createLinearGradient(0,1024,0,1120);
+  readG.addColorStop(0,'#FCEAAE'); readG.addColorStop(1,'#E6BE55');   // 亮金漸層（跟 SPIN 鈕同調，取代芥末平塗）
+  ctx.fillStyle=readG; rr(48,1024,212,96,12); ctx.fill();
+  ctx.strokeStyle='#B8860B'; ctx.lineWidth=3; rr(48,1024,212,96,12); ctx.stroke();
+  txt('BET', 154, 1044, 20, COL.line); txt('88', 154, 1090, 46, COL.line);
+  ctx.fillStyle=readG; rr(460,1024,212,96,12); ctx.fill();
+  ctx.strokeStyle='#B8860B'; ctx.lineWidth=3; rr(460,1024,212,96,12); ctx.stroke();
+  txt('WIN', 566, 1044, 20, COL.line); txt(st.win.toLocaleString(), 566, 1090, st.win>=1000000?32:46, COL.line);
+  const ready=canSpin();
+  const pulse= st.hs&&st.hs.waiting ? 1+.05*Math.sin(performance.now()/180) : 1;
+  ctx.save(); ctx.translate(360,1120); ctx.scale(pulse,pulse);
+  const g=ctx.createRadialGradient(0,-14,8,0,0,78);
+  if(ready){ g.addColorStop(0,'#FFF3C0'); g.addColorStop(.6,COL.gold); g.addColorStop(1,COL.goldDD); }
+  else { g.addColorStop(0,'#6b5230'); g.addColorStop(1,'#403020'); }
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,78,0,7); ctx.fill();
+  ctx.strokeStyle=ready?'#fff':'#7a6a4a'; ctx.lineWidth=4; ctx.stroke();
+  txtS('SPIN', 0, 0, 34, ready?COL.redD:'#5C4A32', ready?'#FFF3C0':'#333', 3);
+  ctx.restore();
+  // H&S 期間：SPIN 下方常駐顯示本次中了什麼特色（不含倍率，倍率改放 BET 下面）
+  if(st.hs){
+    const f=st.hs.flags, tags=[];
+    if(f.u) tags.push('UPSIZED'); if(f.y) tags.push('YUMMY'); if(f.m) tags.push('MAGIC');
+    txt(tags.join('　＋　')||'基本收集', 360, 1214, 20, COL.line);
+    // 有輪盤倍率 → BET 下面放 ×N 金幣獎章（滿輪收分時從這裡噴火到 reel）
+    if(st.hs.mult>1) drawMultCoin(154, 1168, 30, st.hs.mult);
+  }
+}
+/* 輪盤放大罩層（跨上下螢幕、最上圖層；背景壓 50% 暗） */
+function drawWheelOverlay(){
+  const z=st.wheel.zoom; if(z<=0) return;
+  ctx.fillStyle='rgba(0,0,0,'+(0.5*z).toFixed(3)+')'; ctx.fillRect(0,0,720,1280);
+  const cy = (TOP.y+168) + (560-(TOP.y+168))*z;
+  const S = 0.28 + (1-0.28)*z;
+  drawDualWheel(360, cy, S, z>0.75);
+}
+function drawBanner(){
+  if(!st.banner) return;
+  ctx.fillStyle='rgba(20,5,3,.5)'; ctx.fillRect(0,0,720,1280);
+  const s=st.bannerScale, w=470*s, h=150*s, x=360-w/2, y=560-h/2;
+  const g=ctx.createLinearGradient(x,y,x,y+h);
+  if(st.banner.gold){ g.addColorStop(0,'#FFE9A8'); g.addColorStop(.5,COL.gold); g.addColorStop(1,COL.goldDD); }
+  else if(st.banner.tone==='purple'){ g.addColorStop(0,COL.purpleL); g.addColorStop(1,COL.purpleM); }   // 乘倍卡＝與多功能符號同一個紫
+  else { g.addColorStop(0,'#D65442'); g.addColorStop(1,COL.redD); }
+  ctx.fillStyle=g; rr(x,y,w,h,18); ctx.fill();
+  ctx.strokeStyle=st.banner.gold?'#fff':st.banner.tone==='purple'?'#F0DBF7':COL.gold; ctx.lineWidth=5; rr(x,y,w,h,18); ctx.stroke();
+  const mainC = st.banner.gold? COL.redD : '#fff';
+  const strk = st.banner.gold? '#FFF3C0' : st.banner.tone==='purple'? '#4A1A59' : COL.redDD;
+  // 結果名直接大字；長名自動縮到框內
+  let fs=56*s; const maxW=w-56;
+  ctx.font='bold '+fs+'px "Microsoft JhengHei"';
+  const tw=ctx.measureText(st.banner.t).width;
+  if(tw>maxW) fs*=maxW/tw;
+  txtS(st.banner.t, 360, 560-(st.banner.sub?16:0), fs, mainC, strk, 6);
+  if(st.banner.sub) txt(st.banner.sub, 360, 560+36, 21*s, st.banner.gold?COL.redDD:'#FFE9A8');
+}
+function frame(){
+  const now=performance.now();
+  ctx.save();
+  if(now<shakeUntil){ ctx.translate(rnd(-shakeMag,shakeMag), rnd(-shakeMag,shakeMag)); }
+  ctx.fillStyle=COL.paper; ctx.fillRect(-20,-20,760,1320);
+  ctx.strokeStyle=goldGrad(); ctx.lineWidth=4; rr(8,8,704,1264,22); ctx.stroke();
+  drawTop(); drawBottom(); drawHSFx(); drawDeck(); drawFX(); drawWheelOverlay(); drawBanner();
+  ctx.restore();
+  const rs=tickResolvers; tickResolvers=[]; rs.forEach(r=>r());
+}
+let rafId=null, intId=null;
+function stopTicker(){ if(rafId){cancelAnimationFrame(rafId);rafId=null;} if(intId){clearInterval(intId);intId=null;} }
+function startTicker(){
+  stopTicker();
+  if(document.hidden){ intId=setInterval(frame,33); }
+  else { const step=()=>{ frame(); rafId=requestAnimationFrame(step); }; rafId=requestAnimationFrame(step); }
+}
+document.addEventListener('visibilitychange',startTicker);
+startTicker();
+
+/* ================= 演出流程 ================= */
+async function showBanner(t,sub,gold,hold=1100,tone){
+  st.banner={t,sub,gold,tone}; st.bannerScale=.85;
+  if(gold){ flash(); shake(5,220); }
+  await tween(160,u=>st.bannerScale=.85+.15*ease(u));
+  await sleep(hold); st.banner=null;
+}
+function makeStrip(){ st.reels.strip=[]; for(let c=0;c<5;c++){ const s=[]; for(let k=0;k<7;k++){ const r=Math.random(); s.push(r<.1?{type:'csc',c:ri(0,2)}: r<.16?{type:'sc'}: lowSym()); } st.reels.strip.push(s);} }
+
+async function spinReels(result){
+  makeStrip();
+  const scInReel = c => { let n=0; for(let r=0;r<3;r++){ const x=result[r*5+c]; if(x&&(x.type==='sc'||x.type==='gsc')) n++; } return n; };
+  const scTotal = [0,1,2,3,4].reduce((a,c)=>a+scInReel(c),0);
+  for(let c=0;c<5;c++){ st.reels.spin[c]=1; st.reels.off[c]=0; st.reels.anticip[c]=false; }
+  const spinAnim = (async()=>{
+    while(st.reels.spin.some(s=>s===1)){
+      for(let c=0;c<5;c++) if(st.reels.spin[c]===1){
+        st.reels.off[c] += st.reels.anticip[c]? 12 : 28;   // 瞇牌時放慢
+      }
+      await nextTick(); } })();
+  await sleep(380);
+  let landedSC=0;
+  for(let c=0;c<5;c++){
+    for(let r=0;r<3;r++){
+      const cell=result[r*5+c];
+      st.grid[r*5+c]=cell;
+      if(cell && (cell.type==='sc'||cell.type==='gsc'||cell.type==='csc')) cell.born=performance.now();
+    }
+    st.reels.spin[c]=0; st.reels.anticip[c]=false;
+    shake(2,70);
+    landedSC += scInReel(c);
+    for(let r=0;r<3;r++){ const cell=st.grid[r*5+c];
+      if(cell&&(cell.type==='sc'||cell.type==='gsc')){ const [px,py]=cellC(r*5+c); fxRing(px,py,cell.type==='gsc'?'#FF8A7A':COL.goldL); } }
+    // 已停 ≥2 個輪盤 SC、且還有 REEL 在滾 → 進入瞇牌：後面 REEL 整條發光＋放慢
+    if(landedSC>=2 && c<4){
+      for(let cc=c+1;cc<5;cc++) st.reels.anticip[cc]=true;
+      st.msg='已中 '+landedSC+' 個輪盤符號 —— 瞇牌看第 3 個！';
+      await sleep(900);
+    } else await sleep(170);
+  }
+  st.reels.anticip=[false,false,false,false,false];
+  await spinAnim;
+}
+function buildResult(spec){
+  const g=[]; for(let i=0;i<15;i++) g.push(lowSym());
+  (spec.wild||[]).forEach(i=>g[i]={type:'wild'});
+  (spec.csc||[]).forEach(o=>g[o.i]={type:'csc',c:o.c,t:o.t,mult:o.m??pick(BALL_MULTS)});
+  (spec.sc||[]).forEach(i=>g[i]={type:'sc'});
+  if(spec.gsc!=null) g[spec.gsc]={type:'gsc'};
+  // 規則：同一個 REEL 只出現一個星星——同欄多顆時只留最上面一顆，其餘還原成一般符號
+  for(let c=0;c<5;c++){ let seen=false; for(let r=0;r<3;r++){ const i=r*5+c;
+    if(g[i]&&(g[i].type==='sc'||g[i].type==='gsc')){ if(seen) g[i]=lowSym(); else seen=true; } } }
+  return g;
+}
+/* 三色SC 打擊寶盆（單次打擊 8% 觸發；觸發後寶盆蓋起來） */
+async function strikeCoins(coinCells, scripted){
+  for(const o of coinCells){
+    const [x,y]=cellC(o.i);
+    const [px,py]=potPos(o.c);
+    const pot=st.pots[o.c], P=POT[o.c];
+    fxFly(x,y,px,py-24,P.c1);
+    st.msg='分數球打擊「'+P.en+'」寶盆！';
+    await sleep(360);
+    pot.pulse=performance.now();
+    const pay=Math.round(o.mult*BET_AMT);
+    st.win+=pay;
+    fxRing(px,py-20,P.ring); shake(4,120);   // BG 打擊不顯示 +數字
+    if(!pot.closed){
+      const hit = scripted? o.t===1 : Math.random()<0.08;
+      if(hit){
+        pot.closed=true; pot.lidT=performance.now();
+        flash(); shake(6,240);
+        fxRing(px,py-20,'#FFFFFF');
+        fxPop('觸發！', px, py-60, COL.goldL);
+        st.msg='「'+P.en+'」觸發！寶盆蓋上';
+        await sleep(520);
+      }
+    }
+    await sleep(70);
+  }
+}
+
+async function openPots(){
+  // 特色結束回 BG：把觸發時蓋上的寶盆掀開・重置
+  const closed=st.pots.filter(p=>p.closed);
+  if(!closed.length) return;
+  st.msg='特色結束 → 寶盆打開・重置';
+  closed.forEach(p=>{ p.opening=performance.now(); p.pulse=performance.now(); });
+  await sleep(420);
+  st.pots.forEach(p=>{ p.closed=false; p.lidT=0; p.opening=0; });
+  await sleep(200);
+}
+async function doSpin(d){
+  if(st.busy) return; st.busy=true;
+  try{
+  st.hs=null; st.topMode='idle';
+  if(st.wheel.hiIn>=0 || st.wheel.hiOut>=0 || st.wheel.dim!=='none') resetWheel();
+  st.pots.forEach(p=>{p.cnt=0;p.pulse=0;p.closed=false;p.lidT=0;p.opening=0;});   // 每局開始寶盆一律開著（防上一局殘留）
+  st.msg='SPIN...';
+  const result = d?.spec? buildResult(d.spec) : randomGrid();
+  await spinReels(result);
+  const coinCells=[]; st.grid.forEach((c,i)=>{ if(c&&c.type==='csc') coinCells.push({i, c:c.c, t:c.t, mult:c.mult??1}); });
+  const stars=st.grid.filter(c=>c&&(c.type==='sc'||c.type==='gsc')).length;
+  const hasR=st.grid.some(c=>c&&c.type==='gsc');
+  st.meters={coins:coinCells.length, stars};
+  await sleep(300);
+  if(coinCells.length){ await strikeCoins(coinCells, !!d); }
+  const f={u:st.pots[0].closed, y:st.pots[1].closed, m:st.pots[2].closed};
+  const anyPot = f.u||f.y||f.m;
+  if(stars>=3){
+    st.msg = hasR? '有紅色星星（R5）→ 直接轉第二層（外圈）！' : '集滿 3 顆星星 → 進入輪盤（內圈）';
+    if(hasR) flash();
+    await sleep(1100);
+    await wheelSeq(hasR?2:1, d);
+  } else if(anyPot){
+    const parts=[]; if(f.u)parts.push('UPSIZED'); if(f.y)parts.push('YUMMY'); if(f.m)parts.push('MAGIC');
+    const name= parts.length===3? '三特色全開' : parts.join('＋');
+    await sleep(500);
+    await showBanner(name, null, false, 1300);   // 只留特色名，拿掉解釋文字
+    await enterHS(f, 1, d?.hsScript, '（寶盆觸發）', d?.hsSeed);
+    await openPots();                    // 特色結束、回到 BG → 寶盆打開・重置
+  } else {
+    st.msg = (coinCells.length||stars)? `打擊 ${coinCells.length} 次未觸發・星星 ${stars}/3 —— 差一點！` : '未中獎，再試一次';
+  }
+  st.busy=false;
+  }catch(e){ if(e!==ABORT) throw e; }   // 被 backToBG 中止：狀態已重置，直接結束
+}
+
+/* ---- 輪盤（小→放大置中→轉；內圈先、UP 換外圈） ---- */
+async function zoomWheel(to){
+  const from=st.wheel.zoom;
+  await tween(450, u=>{ st.wheel.zoom=from+(to-from)*ease(u); });
+  st.wheel.zoom=to;
+}
+async function spinRing(ring, targetName){
+  const segs = ring==='in'? SEG_IN : SEG_OUT;
+  const sw=360/segs.length, idx=segs.indexOf(targetName);
+  const key = ring==='in'? 'rotIn':'rotOut';
+  const start=st.wheel[key];
+  const finalMod=((-90-(idx+.5)*sw)%360+360)%360;
+  const delta=((finalMod-(start%360))%360+360)%360 + 1440;
+  await tween(2400, u=> st.wheel[key]=start+delta*ease(u));
+  if(ring==='in') st.wheel.hiIn=idx; else st.wheel.hiOut=idx;
+  shake(4,180);
+  for(let k=0;k<4;k++){
+    if(ring==='in') st.wheel.flashIn=k%2===0; else st.wheel.flashOut=k%2===0;
+    await sleep(210);
+  }
+  st.wheel.flashIn=false; st.wheel.flashOut=false;
+}
+async function wheelSeq(layer,d){
+  resetWheel();
+  const w=st.wheel;
+  let ring = layer===2? 'out':'in';
+  w.dim = ring==='out'? 'in':'out';
+  st.msg = ring==='out'? '紅色星星 → 直接轉第二層（外圈）！' : '進入輪盤：先轉第一層（內圈）';
+  await zoomWheel(1);
+  await sleep(600);
+  let targetName = d? (layer===1? d.w1 : d.w2) : null;
+  while(true){
+    if(!targetName){
+      const pool = ring==='in'
+        ? ['雙盤面','SPIN回4','多功能符號','三特色全開','MAJOR','UP','UP']
+        : ['雙盤面＋SPIN回4','多功能符號','雙盤面＋多功能符號','SPIN回4＋多功能符號','三特色全開','MAJOR','GRAND'];
+      targetName = pick(pool);
+    }
+    st.msg = ring==='in'? '轉動內圈（第一層）...' : '轉動外圈（第二層）...';
+    await spinRing(ring, targetName);
+    if(targetName==='UP'){
+      await showBanner('UP', '升級 → 換轉第二層（外圈）', false, 1300);
+      w.dim='in'; w.hiIn=-1;
+      ring='out'; targetName = d? d.w2 : null;
+      shake(3,150);
+      await sleep(400); continue;
+    }
+    if(targetName==='GRAND'){
+      shake(6,300); flash();
+      await showBanner('GRAND', '第二層限定・終極大獎', true, 2200);
+      st.win += 8888888; st.msg='GRAND！（金額示意，由數學組訂）';
+      await zoomWheel(0); return;
+    }
+    if(targetName==='MAJOR'){
+      await showBanner('MAJOR', null, true, 1500);
+      st.win += 88888; st.msg='MAJOR 彩金！';
+      await zoomWheel(0); return;
+    }
+    const f=comboFlags(targetName), mult= ring==='in'?2:3;
+    await showBanner(targetName, null, false, 1300);   // 只留特色名，拿掉解釋文字
+    await zoomWheel(0);
+    await enterHS(f, mult, d?.hsScript, '（輪盤'+(ring==='in'?'內圈×2':'外圈×3')+'）', d?.hsSeed);
+    return;
+  }
+}
+function comboFlags(n){ return {
+  u:n.includes('雙盤面')||n==='三特色全開',
+  y:n.includes('SPIN回4')||n==='三特色全開',
+  m:n.includes('多功能符號')||n==='三特色全開' }; }
+
+/* ---- H&S（每次收集 SPIN 都由玩家自己按） ---- */
+let hsSpinWaiter=null, hsSpinRejecter=null;
+function awaitHsSpin(){
+  st.hs.waiting=true; st.msg='按 SPIN 繼續收集！';
+  return new Promise((res,rej)=>{
+    hsSpinWaiter=()=>{ if(st.hs)st.hs.waiting=false; hsSpinWaiter=null; hsSpinRejecter=null; res(); };
+    hsSpinRejecter=()=>{ hsSpinWaiter=null; hsSpinRejecter=null; rej(ABORT); };   // backToBG 中止等待
+  });
+}
+function emptyHS(){ return Array(15).fill(null); }
+/* 每格滾輪的帶：中間會有球滾過去，最後一格＝停下來看到的（球 or 空） */
+function makeCellStrip(payload){
+  // 帶上球少一點（視覺）：滾動時偶爾滾過一顆球即可；實際落球率由 buildPlan 決定，這裡不影響出球率
+  const s=[];
+  const n=ri(2,3);
+  for(let k=0;k<n;k++) s.push(Math.random()<0.25? {type:'ball',val:pick([50,100,200,500])} : null);
+  if(!payload) s.push({type:'ball',val:pick([50,100,200,500])});   // 沒中：停之前先讓一顆球滾過去（差一點）
+  s.push(payload? (payload.kind==='multi'? {type:'multi',flip:1} : {type:'ball',val:payload.val}) : null);
+  return s;
+}
+/* 所有空格同時起轉，左→右逐軌停下 */
+async function spinCells(bi, plan){
+  if(!plan.length) return {landed:false, revealed:[]};
+  const board=st.hs.boards[bi], rollers=st.hs.rollers[bi];
+  const rls = plan.map(p=>({i:p.i, strip:makeCellStrip(p.payload), off:0, spinning:true}));
+  rollers.push(...rls);
+  let running=true;
+  const loop=(async()=>{ while(running){ for(const rl of rls) if(rl.spinning) rl.off+=0.42; await nextTick(); } })().catch(e=>{ if(e!==ABORT) throw e; });
+  await sleep(420);
+  let landed=false;
+  for(let c=0;c<5;c++){
+    const group=rls.filter(rl=>rl.i%5===c);
+    if(!group.length) continue;
+    await Promise.all(group.map(async rl=>{
+      rl.spinning=false;
+      const L=rl.strip.length, cur=rl.off, curMod=((cur%L)+L)%L;
+      let need=(L-1)-curMod; if(need<0) need+=L;
+      const dist=need+L;                       // 至少再繞一圈才停
+      await tween(520, u=>{ rl.off=cur+dist*ease(u); });
+      rl.off=cur+dist;
+    }));
+    for(const rl of group){
+      const p=plan.find(x=>x.i===rl.i);
+      if(p.payload){
+        board[rl.i]= p.payload.kind==='multi'
+          ? {type:'multi',flip:1,born:performance.now()}
+          : {type:'ball',val:p.payload.val,born:performance.now()};
+        landed=true;
+        if(bi===0){ const [px,py]=cellC(rl.i); fxRing(px,py,COL.gold); }   // 落球只留光圈，不顯示 +分數
+        shake(3,90);
+      }
+      rollers.splice(rollers.indexOf(rl),1);
+    }
+    await sleep(80);
+  }
+  running=false; await loop;
+  // 多功能符號：**只開牌揭曉**，交給 enterHS 跨盤依固定順序逐一演出（同時間只演一個）
+  const multis = plan.filter(p=>p.payload && p.payload.kind==='multi');
+  const revealed=[];
+  if(multis.length){
+    for(const p of multis){ await sleep(200); revealed.push({i:p.i, fn: await revealMulti(board, p.i, p.payload.fn), target:p.payload.target}); }
+    await sleep(multis.length>1? 620:420);
+  }
+  return {landed, revealed};
+}
+/* 每格獨立判定：有腳本照腳本，否則每格 5% 落球 */
+function buildPlan(board, flags, scriptDrops){
+  const plan=[];
+  board.forEach((cell,i)=>{
+    if(cell) return;
+    let payload=null;
+    if(scriptDrops){
+      const d=scriptDrops.find(x=>x.i===i);
+      if(d) payload = d.type==='multi'? {kind:'multi', fn:d.fn, target:d.target} : {kind:'ball', val:d.val??pick([50,100,200,500])};
+    } else if(Math.random()<0.05){
+      payload = (flags.m && Math.random()<0.4)? {kind:'multi'} : {kind:'ball', val:pick([50,100,100,200,500])};
+    }
+    plan.push({i, payload});
+  });
+  return plan;
+}
+async function enterHS(flags, mult, script, srcNote, seedSpec){
+  const dual=flags.u;
+  // 規格：觸發後補 5～10 顆分數球（每盤各自補）；劇本可用 hsSeed 指定位置，否則隨機並避開劇本要落子的格子
+  const seedsOf = bi => {
+    if(seedSpec && seedSpec[bi]) return seedSpec[bi].map(i=>({i, val:pick([50,100,100,200,500])}));
+    const reserved=new Set();
+    if(script) script.forEach(stp=>{ (stp[bi]||[]).forEach(d=>{ if(d.i!=null) reserved.add(d.i); }); });
+    const pool=[...Array(15).keys()].filter(i=>!reserved.has(i));
+    for(let k=pool.length-1;k>0;k--){ const j=ri(0,k); [pool[k],pool[j]]=[pool[j],pool[k]]; }
+    const n=Math.min(ri(5,10), pool.length);
+    return pool.slice(0,n).map(i=>({i, val:pick([50,100,100,200,500])}));
+  };
+  const s0=seedsOf(0), s1= dual? seedsOf(1) : null;
+  const b0=emptyHS(), b1= dual? emptyHS() : null;
+  const max = flags.y?4:3;
+  // 兩個盤面的場次**各自獨立計算**
+  st.hs={boards:[b0,b1], rollers:[[],[]], flags, spins:[max, dual?max:0], max, mult, sum:0,
+         justReset:[false,false], waiting:false, colFrame:null, grandLit:[[false,false,false,false,false],[false,false,false,false,false]]};
+  st.topMode = dual? 'board2' : 'idle';
+  await sleep(500);
+  // **補球：一顆一顆出現**（不是滾出來，讓玩家看清楚「機台在補球給你」）
+  st.msg='進場補球：機台先補幾顆分數球';
+  const n=Math.max(s0.length, s1?s1.length:0);
+  for(let k=0;k<n;k++){
+    if(s0[k]){ b0[s0[k].i]={type:'ball',val:s0[k].val,born:performance.now()};
+      const [px,py]=cellC(s0[k].i); fxRing(px,py,COL.goldL); }
+    if(s1&&s1[k]) b1[s1[k].i]={type:'ball',val:s1[k].val,born:performance.now()};
+    shake(2,60);
+    await sleep(155);
+  }
+  st.msg='H&S 開始'+srcNote+(flags.y?'・YUMMY 回 4':'')+(dual?'・雙盤面':'');
+  const queue = script? [...script] : null;
+  await sleep(700);
+  const boardDone = bi => st.hs.spins[bi]<=0 || st.hs.boards[bi].every(Boolean);
+  const activeBoards = () => (dual?[0,1]:[0]).filter(bi=>!boardDone(bi));
+  while(activeBoards().length){
+    await awaitHsSpin();
+    await sleep(360);
+    const step = queue && queue.length? queue.shift() : null;
+    st.msg='每格滾輪轉動中——看有沒有球停下來...';
+    const bis = activeBoards();
+    const plans = bis.map(bi=>buildPlan(st.hs.boards[bi], flags, step? (step[bi]||[]) : null));
+    // **兩個盤面一起轉**（reel 同步）
+    const res = await Promise.all(bis.map((bi,k)=>spinCells(bi, plans[k])));
+    // **多功能符號跨盤依序演出**（即使上下盤面同時落多功能，也一次只演一個）
+    const allMultis=[];
+    bis.forEach((bi,k)=> res[k].revealed.forEach(r=> allMultis.push({bi, i:r.i, fn:r.fn, target:r.target})));
+    allMultis.sort((a,b)=>MULTI_ORDER.indexOf(a.fn)-MULTI_ORDER.indexOf(b.fn));
+    for(const mm of allMultis){ await applyMulti(st.hs.boards[mm.bi], mm.i, mm.fn, mm.bi, mm.target); await sleep(220); }
+    // 場次各盤獨立：有球停下→該盤重置；沒有→該盤 -1
+    bis.forEach((bi,k)=>{
+      if(res[k].landed){ st.hs.spins[bi]=max; st.hs.justReset[bi]=true; }
+      else st.hs.spins[bi]--;
+    });
+    st.msg = res.some(r=>r.landed)? '有球停下 → 該盤 SPIN 重置回 '+max : '球都滾過去了 —— 差一點！';
+    await sleep(650);
+    st.hs.justReset=[false,false];
+    for(const bi of bis) await checkColumns(st.hs.boards[bi], bi);
+  }
+  let tally=0;
+  st.hs.boards.forEach(b=>{ if(b) b.forEach(c=>{ if(c&&c.type==='ball') tally+=c.val; }); });
+  const banked=st.hs.sum;                          // banked＝滿欄已即時進 WIN 的部分（mult＝參數，即 st.hs.mult）
+  const total=(banked+tally)*mult;
+  st.msg='H&S 結束 → 結算';
+  await sleep(600);
+  st.win+=tally*mult;                              // 只補結算剩餘球（滿欄部分已進 WIN，不重複加）
+  await showBanner(total.toLocaleString(), '收集 '+(banked+tally).toLocaleString()+(mult>1?'（× '+mult+'）':''), true, 2200);
+  st.hs=null; st.topMode='idle'; st.msg='完成！WIN 本次 +'+total.toLocaleString();
+}
+async function checkColumns(board, bi){
+  for(let c=0;c<5;c++){
+    const idx=[c,c+5,c+10];
+    if(idx.every(i=>board[i]&&board[i].type==='ball')){
+      const s=idx.reduce((a,i)=>a+board[i].val,0);   // 乘倍前總分（給結算 banked 用）
+      const m=st.hs.mult;
+      const pos = i => bi===0? cellC(i) : cellCbi(bi,i);   // 上下盤各自座標
+      // ① 整個 reel 都有球 → 紅色火焰框住整個 reel（略停看清楚）；上下盤效果一致
+      st.hs.colFrame={bi, c, flame:true};
+      st.hs.grandLit[bi][c]=true;                  // 滿一整軌 → 該盤該軌上方 G/R/A/N/D 亮起
+      st.msg='第 '+(c+1)+' 軌集滿！';
+      for(const i of idx){ board[i]={...board[i],big:true}; const [px,py]=pos(i); fxRing(px,py,'#FF7A3C'); }
+      flash(); shake(5,220);
+      await sleep(750);                            // 略停：看紅色火焰框住整軌
+      // ② 左下 ×N 對「整軌三顆一起」噴火 → 一起乘倍 → 露出分數（略停看清楚）
+      if(m>1){
+        for(const i of idx){ const [px,py]=pos(i); for(let k=0;k<5;k++) fxFire(154, 1168, px, py); }   // 三顆一起噴
+        st.msg='左下 ×'+m+' → 對整軌分數球噴出';
+        shake(3,150);
+        await sleep(640);                          // 略停：看火焰飛到三顆球上
+        for(const i of idx){ board[i]={...board[i], val:board[i].val*m, big:true, born:performance.now()}; const [px,py]=pos(i); fxRing(px,py,'#FF9A20'); }
+        flash(); shake(4,160);
+        st.msg='整軌 ×'+m+'！';
+        await sleep(780);                          // 略停：看清楚乘出來的分數（破 10× 自動變紅）
+      }
+      // ③ 整軌一起收進 WIN 欄位（略停）
+      const total=idx.reduce((a,i)=>a+board[i].val,0);   // 乘倍後總分
+      for(const i of idx){ const [px,py]=pos(i); fxWin(px,py, board[i].val.toLocaleString()); st.win+=board[i].val; board[i]=null; }
+      st.hs.sum+=s;                                // banked 記乘倍前總分（與結算公式一致）
+      st.msg='收進 WIN +'+total.toLocaleString();
+      await sleep(680);                            // 略停：收完再換下一個 reel
+      st.hs.colFrame=null;
+    }
+  }
+}
+/* 開牌（只翻面揭曉功能，不演出） */
+async function revealMulti(board,i,forced){
+  const fn = forced || pick(['honey','chili','bigball','mult']);
+  await tween(220,u=>{ board[i]={type:'multi',flip:1-2*u}; });
+  board[i]={type:'multi',reveal:fn,flip:1};
+  await tween(220,u=>{ board[i]={type:'multi',reveal:fn,flip:-1+2*u}; });
+  shake(3,90);
+  return fn;
+}
+/* 多顆同時落下時的演出順序（固定）：大分球 → 加分 → 收分 → 乘倍 */
+const MULTI_ORDER=['bigball','chili','honey','mult'];
+async function resolveMulti(board,i,forced,bi){
+  const fn = await revealMulti(board,i,forced);
+  await sleep(480);
+  await applyMulti(board,i,fn,bi);
+}
+async function applyMulti(board,i,fn,bi,target){
+  const balls=board.map((c,k)=>c&&c.type==='ball'?k:null).filter(v=>v!=null);
+  const C = k=> cellCbi(bi,k);                        // 兩盤通用座標（上下盤各自演出）
+  // 功能標題卡：先讓聽眾知道「接下來演哪個功能」，再開始演（清楚優先）
+  const CARD={ honey:'全收', chili:'加分', bigball:'大分球', mult:'乘倍' };
+  await showBanner(CARD[fn], null, false, 1000, fn==='mult'?'purple':undefined);   // 乘倍卡用紫底，其餘紅底
+  if(fn==='honey'){
+    // 全收＝旋渦把盤面所有分數球的「分數」吸到自己身上變成一顆大分球；**原本的球留在盤面**
+    let s=0; balls.forEach(k=>{ s+=board[k].val; });
+    const pc=C(i);
+    st.msg='蜂蜜 → 全收！旋渦吸收全盤分數（原本的球留著）';
+    if(pc){
+      st.hs.swirl={x:pc[0],y:pc[1]};                 // 開旋渦（放慢：先轉一會，再分批把球吸進來）
+      shake(3,160); await sleep(650);
+      for(const k of balls){ const p=C(k);
+        if(p) fxSpiral(p[0],p[1],pc[0],pc[1],'#E9756B', board[k].val.toLocaleString());
+        board[k]={...board[k],big:true};
+        await sleep(120); }                          // 一顆一顆吸，整體變慢
+      await sleep(900);
+      st.hs.swirl=null;
+    } else { await sleep(600); }
+    for(const k of balls) board[k]={...board[k],big:false};
+    board[i]={type:'ball',val:(s||pick([100,200])),big:true,born:performance.now()};
+    if(pc){ fxRing(pc[0],pc[1],COL.goldL); fxPop(s.toLocaleString()+'！',pc[0],pc[1],COL.goldL); }
+    st.msg='蜂蜜變成大分球 '+s.toLocaleString()+'！';
+    await sleep(800);
+  } else if(fn==='chili'){
+    // 加分＝先跳動抽數字（可能值＝分數球面值）4~7 次停下，再加到全盤分數球
+    const CAND=[50,100,200,500], pc=C(i);
+    const ticks=Math.max(4,ri(4,7));
+    let add=pick(CAND);
+    for(let t=0;t<ticks;t++){
+      add=pick(CAND);
+      if(pc) st.hs.num={x:pc[0],y:pc[1],val:add};
+      st.msg='辣椒 → 加分！抽數字…';
+      const left=ticks-1-t;                          // 最後 3 次快要停時變慢
+      let d;
+      if(left===0) d=640; else if(left===1) d=460; else if(left===2) d=310; else d=110;
+      await sleep(d);
+    }
+    st.hs.num=null;
+    st.msg='辣椒 → 全盤分數球 +'+add+'！';
+    await sleep(200);
+    for(const k of balls){ board[k]={...board[k],val:board[k].val+add,big:true};
+      const p=C(k); if(p) fxPop('+'+add,p[0],p[1],'#7FE39B'); }
+    shake(4,160);
+    await sleep(550);
+    for(const k of balls) board[k]={...board[k],big:false};
+    board[i]={type:'ball',val:add,born:performance.now()};
+  } else if(fn==='bigball'){
+    const TIERS=[1,2,5,10,12,15,20];              // ×BET 分階（內部用，畫面不顯示倍數）
+    const flips=ri(2,6);                          // 隨機「成功轉過去」次數 2~6
+    const targetIdx=Math.min(flips,TIERS.length-1);
+    const V=k=>BET_AMT*TIERS[k];
+    let idx=0, sign=1;
+    board[i]={type:'ball',val:V(0),big:true,flip:sign};
+    st.msg='大分球 → 金幣慢慢翻…轉過去就成功加分';
+    await sleep(500);
+    const pc=C(i);
+    for(let f=1; f<=targetIdx; f++){
+      // 瞇牌：假動作——轉一半又縮回來，這次沒轉過去（分數不變）
+      if(f>1 && Math.random()<0.55){
+        st.msg='瞇牌…差一點！';
+        const s0=sign, cur=V(idx);
+        await tween(560,u=>{ const p=Math.sin(Math.PI*u);            // 0→1→0
+          board[i]={type:'ball',val:cur,big:true,flip:s0*(1-0.78*p)}; });  // 掃到 ~0.22 又回，不過側邊
+        board[i]={type:'ball',val:cur,big:true,flip:s0};
+        await sleep(260);
+      }
+      // 真的轉過去：flip 由 sign 慢慢掃到 -sign，越過側邊(0)時翻出下一階分數
+      const from=sign, to=-sign, oldV=V(idx), newV=V(f);
+      st.msg='大分球慢慢翻…';
+      await tween(720,u=>{
+        const fl=from+(to-from)*u;                                   // 線性慢轉，側邊停留感由過 0 呈現
+        const sameSide = fl===0? false : (fl>0)===(from>0);
+        board[i]={type:'ball',val: sameSide? oldV:newV, big:true, flip:fl};
+      });
+      idx=f; sign=to;
+      board[i]={type:'ball',val:newV,big:true,flip:sign};
+      shake(2,80);
+      st.msg='轉過去了！分數 → '+newV.toLocaleString();
+      await sleep(340);
+    }
+    const finalVal=V(targetIdx);
+    board[i]={type:'ball',val:finalVal,big:true};
+    if(pc){ fxRing(pc[0],pc[1],COL.goldL); fxPop(finalVal.toLocaleString()+'！',pc[0],pc[1],COL.goldL); }
+    shake(5,200);
+    st.msg='大分球停在 '+finalVal.toLocaleString()+'！';
+    await sleep(480);
+  } else {
+    // 乘倍＝漂浮的乘倍圈先顯示這次倍數(×2/×3/×5)，再飛去打在球上讓分數乘倍；一次隨機打 1~3 顆，每顆倍數各自抽
+    if(balls.length){
+      const origin=C(i);                             // 多功能符號所在格＝乘倍圈出發點
+      const hitCount=Math.min(balls.length, ri(1,3));
+      const pool=balls.slice(), targets=[];
+      if(target!=null && pool.includes(target)){ targets.push(target); pool.splice(pool.indexOf(target),1); }  // 劇本指定的先納入
+      while(targets.length<hitCount && pool.length){ targets.push(pool.splice(ri(0,pool.length-1),1)[0]); }
+      st.msg='乘倍 → 這次打 '+targets.length+' 顆分數球';
+      await sleep(300);
+      for(const bk of targets){
+        const m=pick([2,3,5]);
+        const dst=C(bk);
+        // ① 漂浮圈出現、顯示這次的倍數
+        st.hs.ring={x:origin[0], y:origin[1]-8, n:m, r:52};
+        st.msg='乘倍圈 ×'+m+' 出現！';
+        await sleep(560);
+        // ② 飛向目標球（縮小落下）
+        await tween(430,u=>{ const e=u<.5? 2*u*u : 1-Math.pow(-2*u+2,2)/2;   // easeInOut
+          st.hs.ring={x:origin[0]+(dst[0]-origin[0])*e, y:(origin[1]-8)+(dst[1]-(origin[1]-8))*e, n:m, r:52-16*e}; });
+        st.hs.ring=null;
+        // ③ 命中：分數乘倍（球上不顯示乘幾倍，分數有變就好）
+        board[bk]={...board[bk], val:board[bk].val*m, big:true, born:performance.now()};
+        if(dst){ fxRing(dst[0],dst[1],'#FFCF6A'); }
+        shake(4,180);
+        st.msg='×'+m+' 命中！分數球 '+board[bk].val.toLocaleString()+(board[bk].val>BET_AMT*10?'（破線轉紅）':'');
+        await sleep(560);
+        board[bk]={...board[bk],big:false};
+      }
+    } else {
+      st.msg='乘倍 → 盤面暫無分數球';
+      await sleep(300);
+    }
+    board[i]={type:'ball',val:pick([50,100]),born:performance.now()};
+  }
+  await sleep(300);
+}
+
+/* ================= 劇本 ================= */
+const SCEN = {
+  A: [ // 打擊+YUMMY：一次 SPIN 就打擊成功 → YUMMY 觸發蓋盆 → H&S
+    {spec:{csc:[{i:7,c:1,t:1}]}, hsScript:[   // 只出一顆綠色 SC（YUMMY）→ 一次打擊即觸發
+      [[{i:1,type:'ball',val:100}]],
+      [[{i:11,type:'ball',val:200},{i:7,type:'ball',val:100}]],
+      [[]],
+      [[{i:12,type:'ball',val:500}]],
+      [[]],
+      [[]],
+    ]},
+  ],
+  B: [   // 固定+UPSIZED：一次 SPIN 出三顆 UPSIZED 色 SC（同色）→ 固定觸發 UPSIZED → 雙盤面 H&S
+    {spec:{csc:[{i:2,c:0,t:0},{i:6,c:0,t:0},{i:8,c:0,t:1}]},   // 三顆同為 UPSIZED(c:0)，第三顆到齊即固定觸發
+     hsSeed:[[1,6,2,13,9],[1,6,3,12,8]],       // 兩盤各補 5 顆：col1 先補 1,6（第 3 顆靠轉出）
+     hsScript:[
+      [[{i:11,type:'ball',val:200}], [{i:11,type:'ball',val:100}]],   // ① 兩盤各補 col1 滿 → 各自整軌收分
+      [[{i:0,type:'ball',val:100},{i:5,type:'ball',val:500}], [{i:0,type:'ball',val:200},{i:5,type:'ball',val:100}]],
+      [[{i:10,type:'ball',val:50}], [{i:10,type:'ball',val:500}]],    // ③ 兩盤各補 col0 滿 → 再各收一軌
+      [[],[]],
+      [[],[]],
+    ]},
+  ],
+  C: [   // 3 星星 → 內圈 UP → 外圈中「多功能符號」→ 一個 SPIN 演一個功能：大分球→加分→乘倍→全收
+    {spec:{sc:[2,8,14]}, w1:'UP', w2:'多功能符號',
+     hsScript:[
+      [[{i:6, type:'multi', fn:'bigball'}]],
+      [[{i:8, type:'multi', fn:'chili'}]],
+      [[{i:11,type:'multi', fn:'mult'}]],
+      [[{i:13,type:'multi', fn:'honey'}]],
+      [[]],
+      [[]],
+      [[]],
+    ]},
+  ],
+  D: [   // 紅星直升外圈 → 中「三特色全開」→ 每個 SPIN 展示一個規格
+    {spec:{sc:[0,6], gsc:9}, w2:'三特色全開',
+     // 指定補球（下盤 6 顆／上盤 5 顆）：兩盤 col0 都先補到 2 顆，第一轉補滿即滿輪
+     hsSeed:[[0,5,2,7,13,4],[0,5,3,8,11]],
+     hsScript:[
+      // ① 出球：上下盤面都有一個 REEL 滿輪收分（col0 補上第 3 顆）
+      [[{i:10,type:'ball',val:200}], [{i:10,type:'ball',val:100}]],
+      // ② 轉出球讓下盤達 9 顆、上盤達 7 顆（滿輪收掉 3 顆後：下盤 4→9、上盤 3→7）
+      [[{i:0,type:'ball',val:100},{i:5,type:'ball',val:50},{i:1,type:'ball',val:200},{i:6,type:'ball',val:100},{i:3,type:'ball',val:500}],
+       [{i:0,type:'ball',val:100},{i:5,type:'ball',val:200},{i:2,type:'ball',val:50},{i:4,type:'ball',val:100}]],
+      // ③ 上下盤各一個多功能符號：上＝大分球、下＝加分
+      [[{i:9,type:'multi',fn:'chili'}], [{i:7,type:'multi',fn:'bigball'}]],
+      // ④ 下盤兩個多功能符號：全收→大分球在 col0(第10格)，乘倍**指定選中這顆收分球**(target:10)，隨即整軌收進 WIN
+      [[{i:10,type:'multi',fn:'honey'},{i:11,type:'multi',fn:'mult',target:10}], []],
+      [[],[]],
+      [[],[]],
+      [[],[]],
+    ]},
+  ],
+  E: [   // 3 星星 → 內圈中「多功能符號」→ 進場分散補球 → spin1 出到 7 顆 → 連 3 次乾淨乘倍 → 落空 3 次結束
+    {spec:{sc:[2,8,14]}, w1:'多功能符號',
+     hsSeed:[[0,6,8,14]],                      // 進場分散補 4 顆（跨行跨欄、不成排）
+     hsScript:[
+      [[{i:2,type:'ball',val:100},{i:10,type:'ball',val:200},{i:12,type:'ball',val:500}]], // spin1：補到 7 顆＝(2,2,1,1,1)，留 3 個安全落點
+      [[{i:1, type:'multi',fn:'mult'}]],       // spin2：乘倍（c1→2，不滿軌）
+      [[{i:3, type:'multi',fn:'mult'}]],       // spin3：乘倍（c3→2，不滿軌）
+      [[{i:9, type:'multi',fn:'mult'}]],       // spin4：乘倍（c4→2，不滿軌）
+      [[]],                                    // spin5：落空
+      [[]],                                    // spin6：落空
+      [[]],                                    // spin7：落空 → SPIN 歸零・結束
+     ]},
+  ],
+};
+async function runScenario(k){
+  if(st.busy) return;
+  const g=GEN;
+  try{
+    freshGrid(); st.win=0; resetWheel(); st.msg='劇本 '+k+' 開始';
+    for(const d of SCEN[k]){ await doSpin(d); if(g!==GEN) return; await sleep(800); }   // 被 backToBG 中止就停
+    st.msg='劇本 '+k+' 播放完畢';
+  }catch(e){ if(e!==ABORT) throw e; }
+}
+/* 隨時中止當前演出、瞬間回到 BG 待機（像重新整理，但保留劇本／速度選擇） */
+function backToBG(){
+  GEN++;                                          // 讓所有進行中的 sleep/tween/nextTick 立刻 reject(ABORT)
+  if(hsSpinRejecter) hsSpinRejecter();
+  fx.length=0; st.banner=null; st.bannerScale=1;
+  freshGrid(); st.win=0; st.hs=null; st.topMode='idle'; resetWheel();
+  st.reels.spin=[0,0,0,0,0]; st.reels.anticip=[false,false,false,false,false];
+  st.pots.forEach(p=>{p.closed=false;p.lidT=0;p.opening=0;p.pulse=0;});
+  st.busy=false; st.msg='按 SPIN 開始';
+}
+
+/* ================= 錄影（VP8/30fps 實測穩定） ================= */
+let rec=null, chunks=[];
+function startRec(){
+  chunks=[];
+  const stream=cv.captureStream(30);
+  const mime=['video/webm;codecs=vp8','video/webm'].find(m=>MediaRecorder.isTypeSupported(m));
+  rec=new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:8_000_000});
+  rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
+  rec.start(200);
+  document.getElementById('recState').textContent='● 錄影中';
+  document.getElementById('btnRec').disabled=true;
+  document.getElementById('btnStop').disabled=false;
+}
+function stopRec(){
+  return new Promise(res=>{
+    rec.onstop=()=>{
+      const blob=new Blob(chunks,{type:'video/webm'});
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob);
+      a.download='提案遊戲_示意_'+new Date().toISOString().slice(11,19).replace(/:/g,'')+'.webm';
+      a.click();
+      document.getElementById('recState').textContent='已下載（'+(blob.size/1048576).toFixed(1)+' MB）';
+      document.getElementById('btnRec').disabled=false;
+      document.getElementById('btnStop').disabled=true;
+      res(blob.size);
+    };
+    rec.stop();
+  });
+}
+async function testRecord(ms){
+  chunks=[]; const stream=cv.captureStream(30);
+  const mime=['video/webm;codecs=vp8','video/webm'].find(m=>MediaRecorder.isTypeSupported(m));
+  const r=new MediaRecorder(stream,{mimeType:mime});
+  r.ondataavailable=e=>chunks.push(e.data);
+  r.start(100);
+  await new Promise(x=>setTimeout(x,ms));
+  return new Promise(res=>{ r.onstop=()=>res(new Blob(chunks).size); r.stop(); });
+}
+
+/* ================= 事件 ================= */
+function pressSpin(){
+  if(st.hs && st.hs.waiting && hsSpinWaiter){ hsSpinWaiter(); return; }
+  if(!st.busy) doSpin();
+}
+cv.addEventListener('click',e=>{
+  const r=cv.getBoundingClientRect();
+  const x=(e.clientX-r.left)*720/r.width, y=(e.clientY-r.top)*1280/r.height;
+  if(Math.hypot(x-360,y-1120)<=80) pressSpin();
+});
+document.getElementById('btnRun').onclick=()=>runScenario(document.getElementById('selScenario').value);
+document.getElementById('btnReset').onclick=()=>backToBG();   // 隨時可按：中止演出、回 BG 待機
+document.getElementById('selSpeed').onchange=e=>{ SPEED=parseFloat(e.target.value); };
+document.getElementById('btnRec').onclick=startRec;
+document.getElementById('btnStop').onclick=stopRec;
+
+window.sim={st, doSpin, runScenario, testRecord, randomGrid, backToBG, setSpeed:v=>SPEED=v, hsSpin:()=>{ if(hsSpinWaiter) hsSpinWaiter(); },
+  paint:()=>frame(),
+  shot:async name=>{ frame(); const r=await fetch('/save?name='+name,{method:'POST',body:cv.toDataURL('image/png')}); return r.status; }};
+</script>
+</body>
+</html>
