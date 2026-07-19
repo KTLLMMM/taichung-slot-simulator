@@ -921,6 +921,11 @@ function buildResult(spec){
 }
 /* 三色SC 打擊寶盆（單次打擊 8% 觸發；觸發後寶盆蓋起來） */
 async function strikeCoins(coinCells, scripted){
+  // 保底觸發規則（隨機 SPIN 用；劇本仍由 t 控制）：
+  //   ① 同色 ≥3 顆 → 該色特色必觸發；② 總數 ≥4 顆 → 每個有出現的顏色都必觸發（可多特色）
+  const cnt=[0,0,0]; coinCells.forEach(o=>cnt[o.c]++);
+  const total=coinCells.length;
+  const guaranteed = c => cnt[c]>=3 || (total>=4 && cnt[c]>=1);
   for(const o of coinCells){
     const [x,y]=cellC(o.i);
     const [px,py]=potPos(o.c);
@@ -933,7 +938,7 @@ async function strikeCoins(coinCells, scripted){
     st.win+=pay;
     fxRing(px,py-20,P.ring); shake(4,120);   // BG 打擊不顯示 +數字
     if(!pot.closed){
-      const hit = scripted? o.t===1 : Math.random()<0.08;
+      const hit = scripted? o.t===1 : (guaranteed(o.c) || Math.random()<0.08);
       if(hit){
         pot.closed=true; pot.lidT=performance.now();
         flash(); shake(6,240);
